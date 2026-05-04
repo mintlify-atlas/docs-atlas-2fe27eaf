@@ -1,0 +1,157 @@
+---
+title: "Open-ended AHT training: ROTATE, PAIRED, Minimax Return"
+description: "Co-evolve an ego agent and an adversarial partner using ROTATE, PAIRED, or Minimax Return to build agents that generalize to unseen teammates."
+---
+
+Open-ended training methods go beyond a fixed partner pool by co-evolving the ego agent with an adversarial partner that actively searches for the ego's weaknesses. The adversary generates a curriculum of increasingly challenging teammates, which pushes the ego to develop more robust cooperative behaviors than it would achieve with a static training set.
+
+All three methods share the same entry point at `open_ended_training/run.py`. The algorithm is selected via the `algorithm` config key, and Hydra merges the appropriate configs at runtime.
+
+## Algorithms
+
+<Tabs>
+  <Tab title="ROTATE">
+    ROTATE (Regret-maximizing Open-ended Training for Ad hoc TEamwork) trains an ego agent alongside a pair of adversarial agents: a confederate and a best-response agent. The confederate maximizes the regret of the ego—the gap between what the best-response achieves against the confederate and what the ego achieves against the confederate. This forces the ego to improve in exactly those situations where it currently performs poorly.
+
+    **Paper:** [Wang et al. 2025](https://arxiv.org/abs/2505.23686)
+
+    ROTATE alternates between two phases in each open-ended iteration:
+
+    1. **Partner phase** — train regret-maximizing confederate/best-response pairs against the current ego.
+    2. **Ego phase** — train the ego against a buffer of partners accumulated across all past iterations.
+
+    ```bash
+    # LBF 7x7, no levels
+    python open_ended_training/run.py \
+        algorithm=rotate/lbf/lbf_7x7_nolevels \
+        task=lbf/lbf_7x7_nolevels \
+        label=my_rotate
+
+    # Overcooked cramped room
+    python open_ended_training/run.py \
+        algorithm=rotate/overcooked-v1/cramped_room \
+        task=overcooked-v1/cramped_room \
+        label=my_rotate
+    ```
+
+    Key ROTATE-specific parameters:
+
+    | Parameter | Description |
+    |---|---|
+    | `NUM_OPEN_ENDED_ITERS` | Number of alternating partner/ego training iterations. |
+    | `TIMESTEPS_PER_ITER_PARTNER` | Timesteps for each partner training phase. |
+    | `TIMESTEPS_PER_ITER_EGO` | Timesteps for each ego training phase. |
+    | `NUM_SEEDS` | Number of independent training seeds run in parallel. |
+
+    Debug run with minimal timesteps:
+
+    ```bash
+    python open_ended_training/run.py \
+        algorithm=rotate/lbf/lbf_7x7_nolevels \
+        task=lbf/lbf_7x7_nolevels \
+        label=debug \
+        algorithm.NUM_OPEN_ENDED_ITERS=1 \
+        algorithm.TIMESTEPS_PER_ITER_PARTNER=1e5 \
+        algorithm.TIMESTEPS_PER_ITER_EGO=1e5 \
+        logger.mode=offline \
+        logger.log_train_out=false \
+        logger.log_eval_out=false \
+        local_logger.save_train_out=false \
+        local_logger.save_eval_out=false
+    ```
+  </Tab>
+  <Tab title="PAIRED">
+    PAIRED (Protagonist Antagonist Induced Regret Environment Design) is an unsupervised environment design algorithm adapted for AHT. It trains three agents simultaneously: an ego (protagonist), an adversarial partner (antagonist/confederate), and a best-response agent. The confederate maximizes the regret of the ego relative to the best-response, using a double-critic architecture to estimate both the protagonist and best-response values.
+
+    **Paper:** [Dennis et al. 2020](https://arxiv.org/abs/2012.02096)
+
+    The PAIRED implementation in JaxAHT is designed to be as faithful to the original algorithm as possible. All three agents—ego (S5-based), confederate (`ActorWithDoubleCriticPolicy`), and best-response (MLP)—are trained jointly in a single scan loop.
+
+    ```bash
+    # LBF 7x7, no levels
+    python open_ended_training/run.py \
+        algorithm=paired/lbf/lbf_7x7_nolevels \
+        task=lbf/lbf_7x7_nolevels \
+        label=my_paired
+
+    # Overcooked cramped room
+    python open_ended_training/run.py \
+        algorithm=paired/overcooked-v1/cramped_room \
+        task=overcooked-v1/cramped_room \
+        label=my_paired
+    ```
+
+    <Note>PAIRED trains all three agents in a single rollout, so `TOTAL_TIMESTEPS` is divided by 3 internally to keep wall-clock time comparable to other methods.</Note>
+  </Tab>
+  <Tab title="Minimax Return">
+    Open-ended Minimax Return is a simpler open-ended training baseline. Rather than maximizing regret, the adversarial partner simply minimizes the ego's return—that is, the confederate acts as an antagonist that tries to make the ego fail rather than exposing gaps in the ego's performance profile.
+
+    Minimax Return serves as a useful ablation point: it tests whether the regret-maximization objective of ROTATE and PAIRED provides a benefit over a basic adversarial setup.
+
+    ```bash
+    # LBF 7x7, no levels
+    python open_ended_training/run.py \
+        algorithm=open_ended_minimax/lbf/lbf_7x7_nolevels \
+        task=lbf/lbf_7x7_nolevels \
+        label=my_minimax
+
+    # Overcooked cramped room
+    python open_ended_training/run.py \
+        algorithm=open_ended_minimax/overcooked-v1/cramped_room \
+        task=overcooked-v1/cramped_room \
+        label=my_minimax
+    ```
+  </Tab>
+</Tabs>
+
+## Common config parameters
+
+All open-ended training methods share the following top-level config structure at `open_ended_training/configs/base_config_oel.yaml`:
+
+| Parameter | Description |
+|---|---|
+| `run_heldout_eval` | Whether to evaluate the trained ego against the heldout partner set after training. |
+| `logger.mode` | W&B logging mode: `online`, `offline`, or `disabled`. |
+| `logger.log_train_out` | Whether to save and upload the full training output as a W&B artifact. |
+| `local_logger.save_train_out` | Whether to keep the training output on disk after the run. |
+
+All numeric hyperparameters can be overridden from the command line using Hydra syntax:
+
+```bash
+python open_ended_training/run.py \
+    algorithm=rotate/lbf/lbf_7x7_nolevels \
+    task=lbf/lbf_7x7_nolevels \
+    algorithm.NUM_OPEN_ENDED_ITERS=5 \
+    algorithm.TIMESTEPS_PER_ITER_PARTNER=5e6 \
+    algorithm.TIMESTEPS_PER_ITER_EGO=5e6 \
+    label=longer_rotate
+```
+
+## Smoke-testing with the test script
+
+The repository includes `scripts/test_algos.sh`, which runs all algorithms (including the open-ended methods) with tiny timestep budgets to verify end-to-end correctness. To run only the open-ended algorithms:
+
+```bash
+# Edit RUN_JOBS in scripts/test_algos.sh to include only rotate, and run:
+bash scripts/test_algos.sh
+```
+
+The script distributes jobs across all available GPUs with at least 20 GB of free memory and writes per-job logs to `results/test_algos_<timestamp>/`.
+
+## Heldout evaluation
+
+After training completes, set `run_heldout_eval=true` to automatically evaluate the trained ego against the downloaded heldout partner set:
+
+```bash
+python open_ended_training/run.py \
+    algorithm=rotate/lbf/lbf_7x7_nolevels \
+    task=lbf/lbf_7x7_nolevels \
+    run_heldout_eval=true \
+    label=eval_run
+```
+
+Download the heldout evaluation partners first if you have not done so:
+
+```bash
+python download_eval_data.py
+```

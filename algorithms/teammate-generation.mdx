@@ -1,0 +1,155 @@
+---
+title: "Teammate generation algorithms: FCP, BRDiv, LBRDiv, CoMeDi"
+description: "Generate a diverse population of training partners with FCP, BRDiv, LBRDiv, or CoMeDi, then automatically train an ego agent against the resulting pool."
+---
+
+Teammate generation methods follow a two-stage pipeline. In the first stage you train a diverse set of partner agents whose behaviors span as much of the teammate space as possible. In the second stage you train an ego agent against that population using PPO Ego. Both stages are handled by a single `run.py` invocation; set `train_ego=true` to run both stages back-to-back, or `train_ego=false` to generate partners only.
+
+All four methods share the same entry point at `teammate_generation/run.py` and produce partner checkpoint files that are automatically passed to the ego training stage.
+
+## Algorithms
+
+<Tabs>
+  <Tab title="FCP">
+    Fictitious Co-Play generates partner diversity by training IPPO agents from multiple random seeds and collecting checkpoints at regular intervals throughout training. The resulting population captures the diversity that arises naturally from different initializations and different stages of learning.
+
+    **Paper:** [Strouse et al. 2021](https://proceedings.neurips.cc/paper/2021/hash/797134c3e42371bb4979a462eb2f042a-Abstract.html)
+
+    FCP uses `marl/ippo.py` as its partner generation subroutine. For each of the `PARTNER_POP_SIZE` independent IPPO runs, it saves `NUM_CHECKPOINTS` parameter snapshots evenly spaced across training. The full partner population seen by the ego agent therefore has size `PARTNER_POP_SIZE × NUM_CHECKPOINTS`.
+
+    ```bash
+    # Generate FCP partners and train ego agent on LBF 7x7
+    python teammate_generation/run.py \
+        task=lbf/lbf_7x7_nolevels \
+        algorithm=fcp/lbf/lbf_7x7_nolevels \
+        train_ego=true \
+        label=my_fcp
+
+    # Overcooked cramped room
+    python teammate_generation/run.py \
+        task=overcooked-v1/cramped_room \
+        algorithm=fcp/overcooked-v1/cramped_room \
+        train_ego=true \
+        label=my_fcp
+    ```
+  </Tab>
+  <Tab title="BRDiv">
+    BRDiv (Best Response Diversity) trains a population of confederate agents alongside corresponding best-response agents. The training objective rewards confederates for being diverse: when a confederate plays with its own best-response it receives positive reward, and when it plays with a different confederate's best-response it receives negative reward. This drives each confederate toward a distinct cooperative behavior.
+
+    **Paper:** [Rahman et al. 2022](https://arxiv.org/abs/2207.14138)
+
+    <Note>BRDiv does not support recurrent actor architectures.</Note>
+
+    ```bash
+    # Generate BRDiv partners only (no ego training)
+    python teammate_generation/run.py \
+        task=lbf/lbf_7x7_nolevels \
+        algorithm=brdiv/lbf/lbf_7x7_nolevels \
+        train_ego=false \
+        run_heldout_eval=false \
+        label=my_brdiv
+
+    # Generate BRDiv partners and train ego on Overcooked
+    python teammate_generation/run.py \
+        task=overcooked-v1/cramped_room \
+        algorithm=brdiv/overcooked-v1/cramped_room \
+        train_ego=true \
+        label=my_brdiv
+    ```
+  </Tab>
+  <Tab title="LBRDiv">
+    LBRDiv (Latent Best Response Diversity) extends BRDiv by encouraging the partner population to emulate the minimum coverage set—the smallest set of policies that a best-responder needs to handle in order to cooperate with any policy in the full space. This leads to more structured diversity than BRDiv and tends to produce partners that are harder for a naive ego to handle.
+
+    **Paper:** [Rahman et al. 2024](https://arxiv.org/abs/2308.09595)
+
+    ```bash
+    # Generate LBRDiv partners on LBF 7x7
+    python teammate_generation/run.py \
+        task=lbf/lbf_7x7_nolevels \
+        algorithm=lbrdiv/lbf/lbf_7x7_nolevels \
+        train_ego=false \
+        run_heldout_eval=false \
+        label=my_lbrdiv
+
+    # Generate LBRDiv partners and train ego
+    python teammate_generation/run.py \
+        task=lbf/lbf_7x7_nolevels \
+        algorithm=lbrdiv/lbf/lbf_7x7_nolevels \
+        train_ego=true \
+        label=my_lbrdiv
+    ```
+  </Tab>
+  <Tab title="CoMeDi">
+    CoMeDi (Cooperative Diverse Teammates) generates diverse partners by optimizing a mixed-play objective that blends self-play and cross-play. Partners are trained to achieve high returns when playing with themselves (self-play) while also learning to cooperate with diverse partners from the population (cross-play), resulting in a set of partners that coordinate well internally yet remain distinct from each other.
+
+    **Paper:** [Sarkar et al. 2023](https://arxiv.org/pdf/2310.15414)
+
+    ```bash
+    # Generate CoMeDi partners on LBF 7x7
+    python teammate_generation/run.py \
+        task=lbf/lbf_7x7_nolevels \
+        algorithm=comedi/lbf/lbf_7x7_nolevels \
+        train_ego=false \
+        run_heldout_eval=false \
+        label=my_comedi
+
+    # Generate CoMeDi partners and train ego
+    python teammate_generation/run.py \
+        task=lbf/lbf_7x7_nolevels \
+        algorithm=comedi/lbf/lbf_7x7_nolevels \
+        train_ego=true \
+        label=my_comedi
+    ```
+  </Tab>
+</Tabs>
+
+## Two-stage pipeline
+
+When you set `train_ego=true`, `run.py` automatically passes the generated partner population to the ego training stage:
+
+<Steps>
+  <Step title="Train partner population">
+    The selected algorithm (FCP, BRDiv, LBRDiv, or CoMeDi) trains a population of diverse partner agents and returns their parameters as a structured pytree.
+  </Step>
+  <Step title="Hand off partners to ego training">
+    `teammate_generation/run.py` calls `train_ego_agent()` from `teammate_generation/train_ego.py`, passing the partner params and an `AgentPopulation` wrapper directly—no file system round-trip required.
+  </Step>
+  <Step title="Train ego agent">
+    PPO Ego trains against the partner population, sampling a partner uniformly at each episode reset. The ego agent config is nested under `algorithm.ego_train_algorithm` in the master config.
+  </Step>
+  <Step title="Optionally run heldout evaluation">
+    If `run_heldout_eval=true`, the trained ego agent is evaluated against the downloaded heldout partner set and metrics are logged to Weights & Biases.
+  </Step>
+</Steps>
+
+## Overriding ego training hyperparameters
+
+Ego training hyperparameters live under the `algorithm.ego_train_algorithm` prefix:
+
+```bash
+python teammate_generation/run.py \
+    task=lbf/lbf_7x7_nolevels \
+    algorithm=fcp/lbf/lbf_7x7_nolevels \
+    train_ego=true \
+    algorithm.TOTAL_TIMESTEPS=1e5 \
+    algorithm.NUM_CHECKPOINTS=2 \
+    algorithm.ego_train_algorithm.TOTAL_TIMESTEPS=1e5 \
+    algorithm.PARTNER_POP_SIZE=4 \
+    algorithm.NUM_SEEDS=1 \
+    label=debug
+```
+
+## Skipping ego training
+
+If you only want the partner checkpoints—for example, to run a custom ego training experiment outside this pipeline—set `train_ego=false` and `run_heldout_eval=false`:
+
+```bash
+python teammate_generation/run.py \
+    task=lbf/lbf_7x7_nolevels \
+    algorithm=brdiv/lbf/lbf_7x7_nolevels \
+    train_ego=false \
+    run_heldout_eval=false \
+    label=partners_only
+```
+
+The generated checkpoints are saved to the Hydra output directory (by default under `results/`) and logged to Weights & Biases as an artifact if `logger.log_train_out=true`.

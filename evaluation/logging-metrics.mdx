@@ -1,0 +1,230 @@
+---
+title: "Logging metrics and monitoring evaluation in JaxAHT"
+description: "Learn how LogWrapper captures episode returns, how W&B and Hydra output are configured, and how rliable produces aggregate stats with confidence intervals."
+---
+
+JaxAHT uses two complementary logging layers: a JAX-level `LogWrapper` that accumulates per-episode metrics inside the environment step function, and a Python-level `Logger` class that ships those metrics to Weights & Biases (W&B) and a local `results/` directory. Understanding what each layer tracks — and where the numbers come from — is essential for correctly interpreting evaluation output.
+
+## The `LogWrapper`
+
+`LogWrapper` (in `envs/log_wrapper.py`) wraps any JaxAHT environment and automatically records episode returns and lengths without any extra bookkeeping in your training loop.
+
+```python
+from envs.log_wrapper import LogWrapper
+from envs import make_env
+
+env = make_env(config["ENV_NAME"], config["ENV_KWARGS"])
+env = LogWrapper(env)
+```
+
+Internally, `LogWrapper` stores four running accumulators in its state dataclass:
+
+```python
+@struct.dataclass
+class LogEnvState:
+    env_state: State
+    episode_returns: float       # accumulator: resets to 0 at episode start
+    episode_lengths: int         # accumulator: resets to 0 at episode start
+    returned_episode_returns: float  # published at episode end
+    returned_episode_lengths: int    # published at episode end
+```
+
+On every `env.step` call, the wrapper adds the current reward to `episode_returns`. When the episode terminates (`done["__all__"]` is `True`), it copies the running total into `returned_episode_returns` and resets the accumulator to zero. The `info` dictionary returned by `step` always contains the current value of `returned_episode_returns`, so your training code can log it without tracking episode boundaries manually.
+
+```python
+obs, state, reward, done, info = env.step(key, state, actions)
+# info["returned_episode_returns"] shape: (num_agents,)
+# info["returned_episode_lengths"] shape: (num_agents,)
+# info["returned_episode"] shape: (num_agents,)  -- True when episode just ended
+```
+
+<Note>
+`returned_episode_returns` sums the reward returned by `env.step()` over an episode. If the environment returns a **shaped** reward (e.g. a potential-based shaping term), `returned_episode_returns` reflects the shaped return, not the true task return. Always check whether your environment uses reward shaping before interpreting this metric as the actual task score. For Overcooked, the unshaped return is tracked separately as `base_return`.
+</Note>
+
+## W&B logging setup
+
+Training scripts initialise a `Logger` object (in `common/wandb_visualizations.py`) from the master config. The logger wraps `wandb.init` and pre-registers metric namespaces so that W&B plots have the right x-axis:
+
+```python
+from common.wandb_visualizations import Logger
+
+logger = Logger(config)
+# Internally calls wandb.init with project, entity, tags, group, etc.
+```
+
+The relevant config block lives in the master config for each algorithm type:
+
+```yaml
+logger:
+  project: jaxaht
+  entity: your-wandb-entity
+  mode: online          # or "disabled" to turn off W&B
+  log_eval_out: true    # upload heldout eval metrics as a W&B artifact
+  tags: []
+  notes: ""
+  group: ""
+```
+
+The `Logger` class defines the following metric step namespaces:
+
+| Namespace | Step metric |
+|---|---|
+| `Train/*` | `train_step` |
+| `Losses/*` | `train_step` |
+| `Eval/*` | `train_step` |
+| `Returns/*` | `train_step` |
+| `HeldoutEval/*` | `iter` |
+
+All training metrics use `train_step` as the x-axis so that curves from runs with different update frequencies remain comparable. Heldout evaluation metrics use `iter` because they are logged once per training checkpoint, not once per gradient step.
+
+## Logger config options
+
+Two config sections control what gets persisted:
+
+```yaml
+logger:
+  log_eval_out: true   # upload heldout eval metrics to W&B as an artifact
+
+local_logger:
+  save_eval_out: false  # keep the eval metrics file locally after logging
+```
+
+- **`log_eval_out`**: When `true`, the raw evaluation metrics pytree is serialised to disk and then uploaded to W&B using `logger.log_artifact`. This lets you later download and re-analyse results without re-running evaluation.
+- **`save_eval_out`**: When `false` (the default), the local copy of the serialised metrics is deleted after upload. Set this to `true` if you want to keep a local copy in the Hydra output directory.
+
+## Local results directory
+
+Hydra writes all run output to a timestamped subdirectory under `results/`. The output path is configured in each method's `configs/hydra/hydra_simple.yaml`:
+
+```yaml
+# Example path: results/lbf/lbf_7x7_nolevels/fcp/2025-05-01_12-00-00/
+hydra:
+  run:
+    dir: results/${task.ENV_NAME}/${task.TASK_NAME}/${algorithm.ALG}/${now:%Y-%m-%d_%H-%M-%S}
+```
+
+Inside each run directory you will find:
+
+| File/dir | Contents |
+|---|---|
+| `.hydra/` | Resolved config snapshot for the run |
+| `saved_train_run/` | Serialised checkpoint(s) from training |
+| `heldout_eval_metrics/` | Raw eval metrics (if `save_eval_out: true`) |
+| `*.csv` | Per-partner metric tables (if `save=True` in `print_metrics_table`) |
+
+## Aggregate statistics and confidence intervals
+
+JaxAHT uses the [rliable](https://github.com/google-research/rliable) library to compute aggregate statistics. Two statistics are supported:
+
+| Statistic | Key | Description |
+|---|---|---|
+| Mean | `mean` | Arithmetic mean across runs and tasks. |
+| IQM | `iqm` | Interquartile mean — the mean of the middle 50% of scores. More robust to outliers than the plain mean. |
+
+Both are computed together with a 95% bootstrapped confidence interval using 25,000 bootstrap resamples. The core functions live in `common/stat_utils.py`:
+
+```python
+def compute_aggregate_stat_and_ci(data: np.ndarray, agg_stat_name: str, return_interval_est: bool):
+    '''Computes the aggregate statistic and the bootstrapped CI over the provided data.
+    Returns a single point estimate and interval estimate for the entire data.
+
+    Args:
+        data: The input NumPy ndarray of shape (num_runs, num_tasks).
+        agg_stat_name: The name of the aggregate statistic to compute ('iqm' or 'mean').
+        return_interval_est: Whether to return the bootstrapped CI.
+    '''
+    aggregate_stat_fn = get_aggregate_stat_fn(agg_stat_name)
+    if return_interval_est:
+        data_dict = {"data": data}
+        point_est, interval_est = rli_library.get_interval_estimates(
+            data_dict,
+            func=lambda x: np.array([aggregate_stat_fn(x)]),
+            reps=25000,
+            confidence_interval_size=0.95
+        )
+        return point_est["data"].squeeze(), interval_est["data"].squeeze()
+    else:
+        return aggregate_stat_fn(data)
+
+def compute_aggregate_stat_and_ci_per_task(data: np.ndarray, agg_stat_name: str, return_interval_est: bool):
+    '''Computes the aggregate statistic and the bootstrapped CI for each task separately.
+    Args:
+        data: The input NumPy ndarray of shape (num_runs, num_tasks).
+        agg_stat_name: The name of the aggregate statistic to compute ('iqm' or 'mean').
+        return_interval_est: Whether to return the bootstrapped CI.
+    '''
+    num_runs, num_tasks = data.shape
+    aggregate_stat_fn = get_aggregate_stat_fn(agg_stat_name)
+    point_ests, interval_ests = [], []
+    for task_idx in range(num_tasks):
+        data_dict = {"data": data[:, [task_idx]]}
+        point_est, interval_est = rli_library.get_interval_estimates(
+            data_dict,
+            func=lambda x: np.array([aggregate_stat_fn(x)]),
+            reps=25000,
+            confidence_interval_size=0.95
+        )
+        point_ests.append(point_est["data"].squeeze())
+        interval_ests.append(interval_est["data"].squeeze())
+    return np.array(point_ests), np.array(interval_ests)
+```
+
+`compute_aggregate_stat_and_ci` returns a single scalar point estimate and a `(lower, upper)` interval over all partners combined. `compute_aggregate_stat_and_ci_per_task` returns one point estimate and one interval per held-out partner (treating each partner as a separate "task"), which populates the per-column values in the logged table.
+
+## `HeldoutEval/FinalEgoVsHeldout` logging format
+
+After evaluation completes, `log_heldout_metrics` (in `evaluation/heldout_eval.py`) logs two things to W&B:
+
+**1. Per-metric scalar** — one `log_item` call per metric, logging the mean score over all partners:
+
+```
+HeldoutEval/FinalEgoVsHeldout/<metric_name>/mean
+```
+
+For example:
+```
+HeldoutEval/FinalEgoVsHeldout/returned_episode_returns/mean = 0.743
+```
+
+**2. XP table** — a `wandb.Table` logged under:
+
+```
+HeldoutEval/FinalEgoVsHeldout-<Aggregate_stat>-CI
+```
+
+For example, with `AGGREGATE_STAT: mean`:
+```
+HeldoutEval/FinalEgoVsHeldout-Mean-CI
+```
+
+The table has the following column structure:
+
+| Algorithm | Metric | Mean (all) | `<heldout_agent_1>` | `<heldout_agent_2>` | ... |
+|---|---|---|---|---|---|
+| fcp | returned_episode_returns | 0.743 (0.71, 0.77) | 0.82 (0.78, 0.86) | 0.67 (0.63, 0.71) | ... |
+
+Each cell in the per-partner columns is formatted as `point_est (lower_ci, upper_ci)` with three decimal places. The `Mean (all)` column aggregates across all partners simultaneously.
+
+The table is also logged via `logger.log_xp_matrix`, which wraps `wandb.Table` and supports optional row labels. You can view it in the W&B run page under **Tables**.
+
+## Cross-play (XP) matrix in W&B
+
+The XP matrix evaluation logs its own table under:
+
+```
+HeldoutEval/FinalEgoVsHeldout-<Aggregate_stat>-CI
+```
+
+The rows are the heldout agents acting as ego (row agent), the columns are the heldout agents acting as partner (column agent). The `Mean (all)` column shows each row agent's average performance across all column agents, giving a quick summary of how well each teammate generalises to diverse partners.
+
+To view results in W&B:
+
+1. Open your W&B project and navigate to the run.
+2. Select the **Tables** tab in the left panel.
+3. Find `HeldoutEval/FinalEgoVsHeldout-Mean-CI` (or `IQM-CI` if you changed `AGGREGATE_STAT`).
+4. Use the column filters to sort by individual partner performance or the aggregate column.
+
+<Tip>
+Switch `AGGREGATE_STAT` from `mean` to `iqm` in `global_heldout_settings.yaml` if your scores have high variance across seeds. The IQM discards the bottom and top 25% of runs, making it less sensitive to a single outlier seed.
+</Tip>

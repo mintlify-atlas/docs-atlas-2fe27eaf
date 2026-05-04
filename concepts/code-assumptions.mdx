@@ -1,0 +1,173 @@
+---
+title: "Code assumptions, gotchas, and partner config in JaxAHT"
+description: "Key assumptions JaxAHT makes about agents, environments, and configs — including done-signal handling, auto-reset, and the episode returns gotcha."
+---
+
+JaxAHT's abstractions work well when you respect a small number of assumptions that are baked into the agent, environment, and population interfaces. Violating any of them silently produces wrong results rather than raising an error, so it is worth understanding them before writing custom agents or environments.
+
+## Agent assumptions
+
+### Policies handle "done" signals internally
+
+When an episode ends, the environment sets `done=True`. JaxAHT does **not** reset hidden states or reinitialize any per-episode agent state on your behalf. Your policy's `get_action` implementation is responsible for detecting `done` and resetting whatever internal state it maintains.
+
+```python
+@partial(jax.jit, static_argnums=(0,))
+def get_action(self, params, obs, done, avail_actions, hstate, rng,
+               aux_obs=None, env_state=None, test_mode=False):
+    # done is passed to you — use it to reset your hidden state
+    ...
+```
+
+<Warning>
+If your policy uses a recurrent hidden state (e.g., an LSTM or GRU) and does not reset it on `done`, it will carry stale state from the previous episode into the new one. This is a silent bug — training will proceed without error but with corrupted hidden states.
+</Warning>
+
+<Tip>
+The standard pattern in JaxMARL-style policies is to multiply the hidden state by `(1 - done)` before the recurrent update, which zeroes it out at episode boundaries without requiring a Python-level conditional.
+</Tip>
+
+### `init_hstate` accepts auxiliary info
+
+`AgentPolicy.init_hstate` takes an optional `aux_info` dict. JaxAHT uses this to pass the agent's index at initialization time, which heuristic agents need to determine which observations belong to them:
+
+```python
+init_hstate_0 = agent_0_policy.init_hstate(1, aux_info={"agent_id": 0})
+init_hstate_1 = agent_1_policy.init_hstate(1, aux_info={"agent_id": 1})
+```
+
+If your policy does not use auxiliary info, you can safely return `None` from `init_hstate`.
+
+## Environment assumptions
+
+### Agents are homogeneous with discrete actions
+
+All environments in JaxAHT assume that every agent in the environment has the same observation space, the same action space, and uses discrete actions. The `BaseEnv.action_space` returns a `spaces.Discrete` object:
+
+```python
+@abstractmethod
+def action_space(
+    self,
+    agent: str
+) -> spaces.Discrete:
+    raise NotImplementedError
+```
+
+<Warning>
+Continuous action spaces are not supported. If you bring in a custom environment with continuous actions, the action masking logic and network output heads will be incorrect.
+</Warning>
+
+### Environments auto-reset at episode end
+
+When `done["__all__"]` becomes `True`, the environment's `step` function must detect this and reset itself internally, returning observations from the first step of the new episode. JaxAHT never calls `env.reset()` during training — it relies entirely on the auto-reset contract.
+
+This design allows the training loop to be expressed as a fixed-length `jax.lax.scan` without branching on episode boundaries, which keeps the full loop JIT-compilable.
+
+The `LogWrapper` is written to handle this: after an episode ends, it stores the episode return and resets its internal accumulators so that the next episode starts cleanly:
+
+```python
+state = jax.tree.map(
+    lambda x, y: jax.lax.select(ep_done, x, y),
+    LogEnvState(
+        env_state,
+        jnp.zeros((self._env.num_agents,)),  # episode_returns reset
+        jnp.zeros((self._env.num_agents,)),  # episode_lengths reset
+        jnp.zeros((self._env.num_agents,)),
+        jnp.zeros((self._env.num_agents,)),
+    ),
+    state)
+```
+
+<Note>
+When wrapping a custom environment, make sure its `step` function calls its own `reset` internally when `done` is `True` and returns the new episode's initial observations. If it does not, the training loop will feed stale terminal observations into the next episode.
+</Note>
+
+## The `returned_episode_returns` gotcha
+
+`LogWrapper` automatically tracks and logs a metric called `returned_episode_returns`. This is the sum of rewards returned by `env.step()` over a complete episode — which sounds straightforward, but has an important implication:
+
+<Warning>
+If your environment applies **reward shaping** (e.g., adding potential-based shaping terms), `returned_episode_returns` reflects the **shaped return**, not the true task return. Do not use it as a measure of task performance when reward shaping is active.
+</Warning>
+
+`LogWrapper` also records `base_return_so_far` in the `WrappedEnvState`, which you can use to track the unmodified reward. Check the environment-specific wrapper to see whether it populates this field.
+
+The metric is emitted per agent (shape `(num_agents,)`) and is only non-zero at the step where an episode finishes — it is set to the just-completed episode's total return and then zeroed out for subsequent steps:
+
+```python
+returned_episode_returns=state.returned_episode_returns * (1 - ep_done)
+    + new_episode_return * ep_done,
+```
+
+This means if you average `returned_episode_returns` over all timesteps you will undercount. Average it only over the timesteps where `returned_episode` is `True`.
+
+## Loading partner agents (partner config)
+
+Workflows that require pre-trained partner agents — ego agent training and heldout evaluation — accept a **partner config** that tells JaxAHT where to find the partner policies and what class to instantiate them with.
+
+Heldout evaluation uses a fixed partner config at `evaluation/configs/global_heldout_settings.yaml` that points to the downloaded evaluation teammates, so you do not need to change anything for standard evaluation runs.
+
+For ego agent training, you must supply your own partner config. The config specifies the path to saved checkpoints, the architecture type, and which checkpoint indices to load:
+
+```yaml
+# Example partner config for ego agent training
+# In ego_agent_training/configs/algorithm/ppo_ego/_base_.yaml
+partner_agent:
+  my_ippo_partners:
+    path: results/ippo/lbf_7x7_nolevels/saved_train_run
+    actor_type: mlp            # mlp, rnn, or s5
+    ckpt_key: final_params     # key in the checkpoint pytree
+    idx_list: [0]              # checkpoint indices to load; null = all
+```
+
+<Tip>
+Generate your training partners first using a teammate generation algorithm (e.g., FCP), then point your ego agent training config at the resulting checkpoint directory. This two-stage workflow is the standard AHT pipeline in JaxAHT.
+</Tip>
+
+Details on the exact fields your partner config must contain are documented at the top of each ego agent training script (e.g., `ego_agent_training/ppo_ego.py`).
+
+## Hydra config override patterns
+
+JaxAHT uses [Hydra](https://hydra.cc) for configuration. Every config key visible in the algorithm or task YAML files can be overridden from the command line without editing any file.
+
+**Select algorithm and task:**
+
+```bash
+python teammate_generation/run.py \
+  task=lbf/lbf_7x7_nolevels \
+  algorithm=fcp/lbf/lbf_7x7_nolevels
+```
+
+**Override a scalar hyperparameter:**
+
+```bash
+python teammate_generation/run.py \
+  task=lbf/lbf_7x7_nolevels \
+  algorithm=fcp/lbf/lbf_7x7_nolevels \
+  algorithm.TOTAL_TIMESTEPS=1e5
+```
+
+**Override a nested key:**
+
+```bash
+python ego_agent_training/run.py \
+  task=overcooked/cramped_room \
+  algorithm=ppo_ego/overcooked/cramped_room \
+  algorithm.partner_config.pop_size=5
+```
+
+<Tip>
+Use Hydra's `--multirun` flag to sweep over hyperparameters without writing a shell loop:
+
+```bash
+python teammate_generation/run.py \
+  --multirun \
+  task=lbf/lbf_7x7_nolevels \
+  algorithm=fcp/lbf/lbf_7x7_nolevels \
+  algorithm.TOTAL_TIMESTEPS=1e5,5e5,1e6
+```
+</Tip>
+
+<Warning>
+Hydra writes outputs to a timestamped subdirectory of `results/` by default. If you run the same experiment twice, the second run does not overwrite the first — it creates a new directory. Check `configs/hydra/hydra_simple.yaml` in the relevant algorithm directory to see and change the output path pattern.
+</Warning>

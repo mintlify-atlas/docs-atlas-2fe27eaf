@@ -1,23 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "JaxAHT",
+  "projectType": "ai-ml",
+  "projectName": "JaxAHT",
+  "projectDescription": "A JAX-based benchmark for Ad Hoc Teamwork (AHT) research, providing environments, algorithms, and evaluation tools for training agents that can cooperate with previously unseen teammates.",
   "theme": "palm",
-  "colors": {
-    "primary": "#4F7CAC",
-    "light": "#E8F0F8",
-    "dark": "#1A3550"
-  },
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/LARG/jax-aht"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/LARG/jax-aht"
-    }
-  },
+  "primaryColor": "#4F7CAC",
+  "lightColor": "#E8F0F8",
+  "darkColor": "#1A3550",
   "navigation": {
     "tabs": [
       {
@@ -95,5 +83,29 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "JAX-accelerated training with full JIT compilation of RL loops",
+    "Unified interface for ego agent training, teammate generation, MARL, and open-ended training",
+    "Heldout evaluation set with pre-trained teammates for LBF and Overcooked",
+    "Single-file algorithm implementations for easy research modification",
+    "Hydra-based configuration management for experiments",
+    "Support for Level-Based Foraging (LBF) and Overcooked-v1 environments",
+    "Integration with Weights & Biases for experiment tracking",
+    "Multiple AHT algorithms: PPO Ego, LIAM, MeLIBA, FCP, BRDiv, LBRDiv, CoMeDi, ROTATE, PAIRED"
+  ],
+  "publicApiSurface": [
+    "AgentPolicy (abstract base class in agents/agent_interface.py)",
+    "AgentPopulation (base class in agents/population_interface.py)",
+    "BaseEnv (abstract base class in envs/base_env.py)",
+    "make_env(env_name, env_kwargs) (factory function in envs/__init__.py)",
+    "LogWrapper (environment wrapper in envs/log_wrapper.py)",
+    "run_episodes() (common/run_episodes.py)",
+    "ego_agent_training/run.py (entry point for PPO Ego, LIAM, MeLIBA)",
+    "teammate_generation/run.py (entry point for FCP, BRDiv, LBRDiv, CoMeDi)",
+    "marl/run.py (entry point for IPPO)",
+    "open_ended_training/run.py (entry point for ROTATE, PAIRED, Minimax)",
+    "evaluation/run.py (entry point for heldout evaluation)",
+    "download_eval_data.py (script to download evaluation agents)"
+  ]
 }

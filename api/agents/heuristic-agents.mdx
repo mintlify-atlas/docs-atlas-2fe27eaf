@@ -1,0 +1,255 @@
+---
+title: "Heuristic partner agents for LBF and Overcooked-v1"
+description: "Reference for rule-based heuristic agents in JaxAHT for LBF and Overcooked — wrappers, constructor parameters, and how to include them in a partner config."
+---
+
+JaxAHT ships with JAX-compatible rule-based heuristic agents for the Level-Based Foraging (LBF) and Overcooked environments. These agents serve as diverse training partners: by including heuristics alongside learned agents in a partner pool, you expose the ego agent to a wider range of behaviors during training. All heuristic agents implement the `AgentPolicy` interface through thin policy-wrapper classes in `agents/lbf/agent_policy_wrappers.py` and `agents/overcooked/agent_policy_wrappers.py`.
+
+<Note>
+Heuristic agents read the full `env_state` rather than only the flat observation. You must pass `env_state` when calling `get_action` on any heuristic agent. Pass `using_log_wrapper=True` when the environment is wrapped in a `LogWrapper`.
+</Note>
+
+---
+
+## LBF heuristic agents
+
+All LBF agents inherit from `BaseAgent` and are exposed through wrappers. The hidden state for each agent is a `flax.struct.dataclass` carrying the agent's internal bookkeeping (index into a fruit sequence, orientation flags, etc.) rather than a neural network carry. You initialize it by calling `init_hstate` with an `aux_info={"agent_id": <int>}` argument.
+
+### `LBFRandomPolicyWrapper`
+
+```python
+class LBFRandomPolicyWrapper(AgentPolicy)
+
+LBFRandomPolicyWrapper()
+```
+
+Selects a uniformly random available action at every step. Takes no constructor arguments. The hidden state is the agent's ID integer and carries no per-episode bookkeeping.
+
+### `LBFGreedyHeuristicPolicyWrapper`
+
+```python
+class LBFGreedyHeuristicPolicyWrapper(AgentPolicy)
+
+LBFGreedyHeuristicPolicyWrapper(
+    grid_size=7,
+    num_fruits=3,
+    heuristic="closest_self",
+    using_log_wrapper=False,
+)
+```
+
+Wraps `GreedyHeuristicAgent`, which navigates toward a target fruit chosen by one of five heuristics and loads when adjacent.
+
+<ParamField path="grid_size" type="int" default="7">
+  Side length of the square grid. Must match the environment configuration.
+</ParamField>
+
+<ParamField path="num_fruits" type="int" default="3">
+  Total number of fruit items in the environment.
+</ParamField>
+
+<ParamField path="heuristic" type="str" default='"closest_self"'>
+  Strategy for selecting the target fruit. Options:
+
+  - `"closest_self"` — targets the fruit with the smallest Manhattan distance to the agent.
+  - `"closest_teammate"` — targets the fruit closest to the teammate.
+  - `"closest_avg"` — targets the fruit closest to the average position of all agents.
+  - `"lowest_level"` — targets the uneaten fruit with the smallest level value.
+  - `"highest_level"` — targets the uneaten fruit with the largest level value.
+</ParamField>
+
+<ParamField path="using_log_wrapper" type="bool" default="False">
+  Set to `True` when the environment is wrapped in `LogWrapper` so the agent unwraps `env_state.env_state` before reading positions.
+</ParamField>
+
+### `LBFSequentialFruitPolicyWrapper`
+
+```python
+class LBFSequentialFruitPolicyWrapper(AgentPolicy)
+
+LBFSequentialFruitPolicyWrapper(
+    grid_size=7,
+    num_fruits=3,
+    ordering_strategy="lexicographic",
+    using_log_wrapper=False,
+)
+```
+
+Wraps `SequentialFruitAgent`, which visits fruits one by one in a fixed order determined at the start of each episode.
+
+<ParamField path="ordering_strategy" type="str" default='"lexicographic"'>
+  Strategy for ordering fruits. Options:
+
+  - `"lexicographic"` — rows top-to-bottom, then columns left-to-right.
+  - `"reverse_lexicographic"` — rows bottom-to-top, then columns right-to-left.
+  - `"column_major"` — columns left-to-right, then rows top-to-bottom.
+  - `"reverse_column_major"` — columns right-to-left, then rows bottom-to-top.
+  - `"nearest_agent"` — sorted by Manhattan distance from the agent's start (closest first).
+  - `"farthest_agent"` — sorted by Manhattan distance from the agent's start (farthest first).
+</ParamField>
+
+### `LBFEntitledPolicyWrapper`
+
+```python
+class LBFEntitledPolicyWrapper(AgentPolicy)
+
+LBFEntitledPolicyWrapper(
+    grid_size=7,
+    num_fruits=3,
+    using_log_wrapper=False,
+)
+```
+
+Wraps `EntitledAgent`, which waits until the teammate positions itself adjacent to a target fruit before moving to collect it together. This agent models a coordination style where one agent defers to the other's lead.
+
+---
+
+## Overcooked heuristic agents
+
+Overcooked heuristic agents all take a `layout` dictionary as their first argument. This must be the augmented layout dict from `envs/overcooked/augmented_layouts.py`, not the raw string layout name. All wrappers accept `using_log_wrapper=False`.
+
+### `OvercookedIndependentPolicyWrapper`
+
+```python
+class OvercookedIndependentPolicyWrapper(AgentPolicy)
+
+OvercookedIndependentPolicyWrapper(
+    layout,
+    using_log_wrapper=False,
+    p_onion_on_counter=0,
+    p_plate_on_counter=0.0,
+)
+```
+
+Wraps `IndependentAgent`, which executes the full soup-delivery pipeline autonomously: pick up onions, fill the pot, get a plate, plate the soup, and deliver it. Works on layouts where a single agent can complete the full pipeline without coordination.
+
+<ParamField path="layout" type="dict" required>
+  Augmented layout dictionary. Retrieve it with `augmented_layouts[layout_name]`.
+</ParamField>
+
+<ParamField path="p_onion_on_counter" type="float" default="0">
+  Probability of placing a held onion on a counter instead of in the pot. Introduces variability in the agent's behavior.
+</ParamField>
+
+<ParamField path="p_plate_on_counter" type="float" default="0.0">
+  Probability of placing a held plate on a counter instead of attempting to plate the soup.
+</ParamField>
+
+### `OvercookedOnionPolicyWrapper`
+
+```python
+class OvercookedOnionPolicyWrapper(AgentPolicy)
+
+OvercookedOnionPolicyWrapper(
+    layout,
+    p_onion_on_counter=0.0,
+    using_log_wrapper=False,
+)
+```
+
+Wraps `OnionAgent`, which focuses only on fetching onions and placing them in the pot (or on a counter with probability `p_onion_on_counter`). Pairs naturally with `OvercookedPlatePolicyWrapper` for a division-of-labor setup.
+
+### `OvercookedPlatePolicyWrapper`
+
+```python
+class OvercookedPlatePolicyWrapper(AgentPolicy)
+
+OvercookedPlatePolicyWrapper(
+    layout,
+    p_plate_on_counter=0.0,
+    using_log_wrapper=False,
+)
+```
+
+Wraps `PlateAgent`, which focuses on fetching plates, plating soup when ready, and delivering it.
+
+### `OvercookedStaticPolicyWrapper`
+
+```python
+class OvercookedStaticPolicyWrapper(AgentPolicy)
+
+OvercookedStaticPolicyWrapper(layout, using_log_wrapper=False)
+```
+
+Wraps `StaticAgent`. The agent never moves — it acts as a fixed obstacle, useful for stress-testing solo-capable ego agents.
+
+### `OvercookedRandomPolicyWrapper`
+
+```python
+class OvercookedRandomPolicyWrapper(AgentPolicy)
+
+OvercookedRandomPolicyWrapper(layout, using_log_wrapper=False)
+```
+
+Selects a uniformly random action at every step.
+
+---
+
+## Using heuristic agents as training partners
+
+To include a heuristic agent in a partner pool for ego-agent training, specify its `actor_type` in the partner config YAML. The `initialize_heuristic_agent_from_config` function in `common/agent_loader_from_config.py` dispatches to the correct wrapper based on the task name and `actor_type`.
+
+```yaml
+# In ego_agent_training/configs/algorithm/ppo_ego/_base_.yaml
+partner_agent:
+  greedy_closest:
+    actor_type: greedy_agent
+    heuristic: closest_self
+    grid_size: 7
+    num_fruits: 3
+```
+
+```python
+from common.agent_loader_from_config import initialize_heuristic_agent_from_config
+
+agent_config = {
+    "actor_type": "greedy_agent",
+    "heuristic": "closest_self",
+    "grid_size": 7,
+    "num_fruits": 3,
+}
+policy = initialize_heuristic_agent_from_config(
+    agent_config=agent_config,
+    agent_name="greedy_closest",
+    task_name="lbf/lbf_7x7_nolevels",
+    env_kwargs={"grid_size": 7, "num_food": 3},
+)
+```
+
+---
+
+## LIAM and MeLIBA agents
+
+`LIAMPolicy` and `MeLIBAPolicy` are not heuristic agents — they are learned ego-agent policies that additionally maintain an explicit partner-modeling module.
+
+**LIAM** (`agents/liam_agent.py`) wraps any `AgentPolicy` with an encoder–decoder pair. The encoder (LSTM or GRU) maps the concatenation of the ego observation and the previous ego action into an embedding, which is appended to the observation before the underlying policy. The decoder reconstructs the partner's next observation and action from the embedding, providing a self-supervised auxiliary loss.
+
+**MeLIBA** (`agents/meliba_agent.py`) uses a variational encoder–RNN that produces separate latent distributions for the partner's "agent character" (persistent type) and "mental state" (time-varying intention). Both distributions are concatenated with the observation before the policy, and a separate decoder RNN reconstructs partner actions for the ELBO loss.
+
+Both agents carry a composite hidden state `(encoder_hstate, policy_hstate)` and require `aux_obs=(act, joint_act, reward)` to be passed to `get_action`.
+
+```python
+from agents.initialize_agents import initialize_liam_agent
+
+config = {
+    "EGO_ACTOR_TYPE": "rnn",
+    "ENCODER_TYPE": "lstm",
+    "ENCODER_HIDDEN_DIM": 64,
+    "ENCODER_OUTPUT_DIM": 64,
+    "DECODER_HIDDEN_DIM": 64,
+    # ... other config keys
+}
+liam_policy, params = initialize_liam_agent(config, env, rng)
+
+hstate = liam_policy.init_hstate(batch_size=1)
+# hstate is (encoder_hstate, policy_hstate)
+```
+
+---
+
+## Related pages
+
+- [AgentPolicy interface](/api/agent-interface) — interface all agents implement
+- [MLP actor-critic](/api/agents/mlp-actor-critic) — stateless learned policy
+- [RNN actor-critic](/api/agents/rnn-actor-critic) — recurrent learned policy
+- [Common utilities](/api/utilities/common) — `run_episodes` and agent loading helpers

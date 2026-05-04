@@ -1,0 +1,88 @@
+---
+title: "JaxAHT: JAX-accelerated benchmark for Ad Hoc Teamwork"
+description: "JaxAHT is a JAX-based benchmark for Ad Hoc Teamwork research, unifying ego agent training, teammate generation, MARL, and open-ended training in one framework."
+---
+
+JaxAHT is a JAX-based benchmark designed to accelerate research across the full lifecycle of **Ad Hoc Teamwork (AHT)** — the problem of training agents that can cooperate with previously unseen teammates. The library provides environments, a suite of AHT and MARL algorithms, and pre-built evaluation tools, all optimized with JAX's JIT compilation for fast iteration.
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Set up JaxAHT with conda and pip in minutes, including CUDA support for GPU training
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Run your first AHT experiment on Level-Based Foraging or Overcooked in minutes
+  </Card>
+  <Card title="Algorithms" icon="brain" href="/algorithms/overview">
+    Explore ego agent training, teammate generation, MARL, and open-ended training algorithms
+  </Card>
+  <Card title="Environments" icon="map" href="/environments/overview">
+    Learn about the supported cooperative multi-agent environments
+  </Card>
+</CardGroup>
+
+## What is Ad Hoc Teamwork?
+
+Ad Hoc Teamwork is the challenge of building agents that can cooperate effectively with unknown, potentially heterogeneous partners at test time — without prior coordination or joint training. This differs from standard MARL, where all agents are trained together from scratch.
+
+JaxAHT structures the AHT research lifecycle into four interconnected algorithm categories:
+
+<CardGroup cols={2}>
+  <Card title="Ego Agent Training" icon="user" href="/algorithms/ego-agent-training">
+    Train an AHT agent (ego) against a fixed population of partner agents using PPO, LIAM, or MeLIBA
+  </Card>
+  <Card title="Teammate Generation" icon="users" href="/algorithms/teammate-generation">
+    Generate diverse training teammates using FCP, BRDiv, LBRDiv, or CoMeDi
+  </Card>
+  <Card title="MARL" icon="network-wired" href="/algorithms/marl">
+    Train teams from scratch with Independent PPO (IPPO)
+  </Card>
+  <Card title="Open-Ended Training" icon="infinity" href="/algorithms/open-ended-training">
+    Jointly train ego agents and environments using ROTATE, PAIRED, or Minimax
+  </Card>
+</CardGroup>
+
+## Key Features
+
+- **JAX-accelerated**: Full JIT compilation of training loops for maximum throughput on GPU/TPU
+- **Unified interface**: A shared agent and population interface lets agents trained by one algorithm plug into another — a common AHT workflow
+- **Single-file algorithms**: Minimally modularized implementations make it easy to understand and modify any algorithm
+- **Heldout evaluation**: Pre-trained evaluation teammates for LBF and Overcooked with downloadable benchmark data
+- **Hydra configuration**: Manage algorithm and task configurations from the command line without touching code
+- **W&B integration**: Automatic experiment tracking with Weights & Biases
+
+## Environments
+
+JaxAHT supports two cooperative multi-agent environments out of the box:
+
+| Environment | Source | Description |
+|-------------|--------|-------------|
+| **Level-Based Foraging (LBF)** | Jumanji | Cooperative foraging with 7×7 and 12×12 grid variants |
+| **Overcooked-v1** | JaxMARL | Cooperative cooking with 5 layout variants |
+
+<Note>
+Both environments include pre-built heldout evaluation sets. Download them with `python download_eval_data.py` after installation.
+</Note>
+
+## Algorithms at a Glance
+
+| Category | Algorithm | Paper |
+|----------|-----------|-------|
+| Ego Agent Training | PPO Ego, LIAM, MeLIBA | [LIAM](https://arxiv.org/abs/2006.09447), [MeLIBA](https://arxiv.org/abs/2101.03864) |
+| Teammate Generation | FCP, BRDiv, LBRDiv, CoMeDi | [FCP](https://proceedings.neurips.cc/paper/2021/hash/797134c3e42371bb4979a462eb2f042a-Abstract.html), [BRDiv](https://arxiv.org/abs/2207.14138), [LBRDiv](https://arxiv.org/abs/2308.09595), [CoMeDi](https://arxiv.org/pdf/2310.15414) |
+| MARL | IPPO | [IPPO](https://arxiv.org/abs/2103.01955) |
+| Open-Ended Training | ROTATE, PAIRED, Minimax | [ROTATE](https://arxiv.org/abs/2505.23686), [PAIRED](https://arxiv.org/abs/2012.02096) |
+
+## Citation
+
+If you use JaxAHT in your research, please cite:
+
+```bibtex
+@misc{jaxaht2025,
+  author = {Learning Agents Research Group},
+  title = {JaxAHT},
+  year = {2025},
+  month = {September},
+  note = {Version 1.0.0},
+  url = {https://github.com/LARG/jax-aht},
+}
+```

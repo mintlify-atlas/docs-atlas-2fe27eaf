@@ -1,0 +1,107 @@
+---
+title: "Ad Hoc Teamwork: training agents for unknown teammates"
+description: "Learn what Ad Hoc Teamwork is, how it differs from MARL, and how JaxAHT structures the full AHT lifecycle into four algorithm categories."
+---
+
+Ad Hoc Teamwork (AHT) is the challenge of building an agent that can cooperate effectively with previously unseen partners at test time — without any prior joint training or coordination. Unlike standard multi-agent RL, where all agents are trained together, an AHT agent must generalize across the behavioral diversity of potential teammates it has never encountered before.
+
+## AHT vs. standard MARL
+
+In standard multi-agent reinforcement learning (MARL), a team of agents trains jointly from scratch. They converge on a shared convention — a joint policy — that may be highly effective between them but brittle when any agent is swapped out. This is sometimes called the **partner-specific training** failure mode: the resulting agents are fine-tuned to each other's behavior and struggle to coordinate with outsiders.
+
+Ad Hoc Teamwork takes the opposite stance. The agent you are training — the **ego agent** — must be robust to the full distribution of potential partners. At test time, it is paired with teammates it has never seen, and must cooperate with them anyway.
+
+| Dimension | Standard MARL | Ad Hoc Teamwork |
+|---|---|---|
+| Training setup | All agents trained together | Ego agent trained against a partner population |
+| Test partners | Same agents as training | Previously unseen teammates |
+| Goal | High joint-team performance | Robust zero-shot cooperation |
+| Key challenge | Convergence, stability | Generalization across teammate diversity |
+
+## The ego agent concept
+
+The central actor in AHT is the **ego agent** — the single learner whose policy you are developing. During training, the ego agent interacts with a **population** of partner agents that stand in for the distribution of teammates it may encounter at test time. The quality of this population directly affects how well the ego agent generalizes.
+
+At test time, the ego agent is evaluated against a **heldout evaluation set**: teammates that were never used during training. JaxAHT provides pre-built heldout evaluation sets for both LBF and Overcooked.
+
+The ego agent training lifecycle looks like this:
+
+<Steps>
+  <Step title="Generate a training population">
+    Use a teammate generation algorithm (e.g., FCP, BRDiv) or a MARL algorithm (e.g., IPPO) to produce a diverse set of partner policies.
+  </Step>
+  <Step title="Train the ego agent">
+    Run an ego agent training algorithm (e.g., PPO Ego, LIAM, MeLIBA) that samples partners from the population each episode and updates the ego policy to cooperate effectively.
+  </Step>
+  <Step title="Evaluate zero-shot cooperation">
+    Pair the trained ego agent with heldout evaluation teammates it has never seen and measure its cooperative return.
+  </Step>
+</Steps>
+
+## The four algorithm categories
+
+JaxAHT organizes every algorithm it provides into one of four categories, each corresponding to a distinct role in the AHT research lifecycle. A complete AHT pipeline typically calls on multiple categories — for example, FCP (teammate generation) uses IPPO (MARL) internally, and every two-stage teammate generation method calls PPO Ego as its ego training subroutine.
+
+<CardGroup cols={2}>
+  <Card title="Ego Agent Training" icon="user" href="/algorithms/ego-agent-training">
+    Trains the AHT ego agent against a fixed pre-specified set of partner agents. This is the final training stage in a two-stage pipeline.
+
+    **Algorithms**: PPO Ego, LIAM ([Papoudakis et al. 2021](https://arxiv.org/abs/2006.09447)), MeLIBA ([Zintgraf et al. 2022](https://arxiv.org/abs/2101.03864))
+  </Card>
+  <Card title="Teammate Generation" icon="users" href="/algorithms/teammate-generation">
+    Produces a diverse population of training teammates for the ego agent. Diversity is key: a richer population leads to better ego agent generalization.
+
+    **Algorithms**: FCP ([Strouse et al. 2021](https://proceedings.neurips.cc/paper/2021/hash/797134c3e42371bb4979a462eb2f042a-Abstract.html)), BRDiv ([Rahman et al. 2022](https://arxiv.org/abs/2207.14138)), LBRDiv ([Rahman et al. 2024](https://arxiv.org/abs/2308.09595)), CoMeDi ([Sarkar et al. 2023](https://arxiv.org/pdf/2310.15414))
+  </Card>
+  <Card title="MARL" icon="network-wired" href="/algorithms/marl">
+    Trains a team of agents jointly from scratch. Used as a subroutine inside teammate generation algorithms to produce a base population of teammates.
+
+    **Algorithms**: IPPO ([Yu et al. 2022](https://arxiv.org/abs/2103.01955))
+  </Card>
+  <Card title="Open-Ended Training" icon="infinity" href="/algorithms/open-ended-training">
+    Jointly trains the ego agent and adapts the partner or environment distribution in an open-ended loop, removing the two-stage separation entirely.
+
+    **Algorithms**: ROTATE ([Wang et al. 2025](https://arxiv.org/abs/2505.23686)), PAIRED ([Dennis et al. 2020](https://arxiv.org/abs/2012.02096)), Open-Ended Minimax
+  </Card>
+</CardGroup>
+
+## How the categories relate
+
+The four categories are not independent — they are designed to be composed. The diagram below captures the most common composition patterns:
+
+- **Two-stage AHT pipelines** run teammate generation first, then ego agent training. Teammate generation internally calls MARL (IPPO) to build its population.
+- **Open-ended training** collapses the two stages into a single joint loop, co-adapting the ego agent and the partner/environment distribution simultaneously.
+- **Standalone MARL** is also useful on its own when you want a team of jointly-trained agents as a baseline.
+
+```
+┌─────────────────────────────────────────┐
+│          Two-Stage AHT Pipeline          │
+│                                          │
+│  ┌──────────────────┐                   │
+│  │  MARL (IPPO)     │──▶ teammate pool  │
+│  └──────────────────┘         │         │
+│         (subroutine)          ▼         │
+│  ┌──────────────────────────────────┐  │
+│  │  Teammate Generation             │  │
+│  │  (FCP / BRDiv / LBRDiv / CoMeDi) │──▶ diverse population
+│  └──────────────────────────────────┘  │
+│                        │               │
+│                         ▼              │
+│  ┌───────────────────────────────────┐ │
+│  │  Ego Agent Training               │ │
+│  │  (PPO Ego / LIAM / MeLIBA)        │ │
+│  └───────────────────────────────────┘ │
+└─────────────────────────────────────────┘
+
+┌──────────────────────────────────────────┐
+│       Open-Ended Training (single loop)  │
+│                                          │
+│  Ego ◀──────────────────▶ Environment / │
+│  Agent                      Partners     │
+│  (ROTATE / PAIRED / Minimax)             │
+└──────────────────────────────────────────┘
+```
+
+<Note>
+Research focused on one algorithm category often still depends on the others. For example, to benchmark a new teammate generation method you need an ego agent training algorithm and MARL-generated baseline teammates. JaxAHT's shared interfaces make these cross-algorithm workflows straightforward.
+</Note>

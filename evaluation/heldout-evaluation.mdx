@@ -1,0 +1,283 @@
+---
+title: "Heldout evaluation against pre-trained AHT teammates"
+description: "Test your ego agent against pre-trained heldout partners covering RL policies, diversity populations, and heuristics across LBF and Overcooked tasks."
+---
+
+Heldout evaluation measures how well your ego agent cooperates with teammates it has never seen during training. JaxAHT ships a curated set of pre-trained held-out teammates — including IPPO policies, diversity-generating populations (BRDiv, LBRDiv, CoMeDi), and heuristic agents — for each supported environment. Running your agent against this fixed set gives a reproducible, comparable score across methods.
+
+## Download the evaluation agents
+
+Before you can run any heldout evaluation, you need to download the pre-trained teammates and the reference best-return data from Hugging Face.
+
+```bash
+python download_eval_data.py
+```
+
+This script downloads and unpacks:
+
+| Asset | Local path |
+|---|---|
+| LBF teammates | `eval_teammates/lbf/` |
+| LBF 12x12 teammates | `eval_teammates/lbf_12x12/` |
+| Overcooked-v1 teammates | `eval_teammates/overcooked-v1/` |
+| Hanabi teammates | `eval_teammates/hanabi/` |
+| Best heldout returns | `results/` |
+
+The script uses `huggingface_hub` to fetch each directory from the `jaxaht/eval-teammates` dataset repo (and `lainwired/jaxaht-hanabi` for Hanabi assets), then moves the extracted files into the correct local paths.
+
+## Global heldout settings
+
+All evaluation behaviour is controlled by `evaluation/configs/global_heldout_settings.yaml`. You should treat this file as the single source of truth for the heldout set definition and modify it with caution.
+
+```yaml
+# evaluation/configs/global_heldout_settings.yaml
+global_heldout_settings:
+  EVAL_SEED: 34957
+  MAX_EPISODE_STEPS: ${task.ROLLOUT_LENGTH}
+  NUM_EVAL_EPISODES: 64
+  AGGREGATE_STAT: mean   # choices: mean, iqm
+  NORMALIZE_RETURNS: true
+
+heldout_set:
+  lbf/lbf_7x7_nolevels:
+    ippo_mlp:
+      path: "eval_teammates/lbf/ippo/2025-04-21_23-41-17/saved_train_run"
+      actor_type: mlp
+      ckpt_key: final_params
+      idx_list: [0]
+      test_mode: false
+      performance_bounds:
+        percent_eaten: [[0.0, 100.0]]
+        returned_episode_returns: [[0.0, 0.5]]
+    # ... additional agents per task
+```
+
+The key settings are:
+
+| Setting | Description |
+|---|---|
+| `EVAL_SEED` | Fixed random seed used to initialise the JAX PRNG key for all evaluations. Keeping this constant ensures reproducibility. |
+| `NUM_EVAL_EPISODES` | Number of episodes run per ego–partner pair. Higher values reduce variance at the cost of evaluation time. Default is 64. |
+| `AGGREGATE_STAT` | Statistic used to summarise results across episodes and seeds. Supports `mean` and `iqm` (interquartile mean). Both are reported with a bootstrapped 95% confidence interval via `rliable`. |
+| `NORMALIZE_RETURNS` | When `true`, each metric is rescaled to `[0, 1]` using the `performance_bounds` stored per teammate in the config. This makes scores comparable across environments with different reward scales. |
+
+Each teammate entry under `heldout_set.<task>` can include a `performance_bounds` dictionary. When `NORMALIZE_RETURNS` is enabled, the evaluator uses these bounds to linearly normalise the raw returns:
+
+```python
+metrics[k] = (metrics[k] - lower) / (upper - lower)
+```
+
+If bounds are missing for a teammate, normalisation is skipped for that partner and a warning is printed.
+
+## Core evaluation functions
+
+### `load_heldout_set`
+
+`load_heldout_set` (in `evaluation/heldout_evaluator.py`) reads the heldout config for the requested task and returns a dictionary mapping agent labels to `(policy, params, test_mode, performance_bounds)` tuples. RL-based agents are loaded from disk; heuristic agents are instantiated directly.
+
+```python
+heldout_agents = load_heldout_set(
+    heldout_cfg,   # config["heldout_set"][config["TASK_NAME"]]
+    env,
+    task_name,
+    env_kwargs,
+    heldout_init_rng,
+)
+# Returns {"ippo_mlp (0)": (policy, params, test_mode, bounds), ...}
+```
+
+When an entry has multiple checkpoints via `idx_list`, each checkpoint is extracted into a separate labelled entry (e.g. `"brdiv-conf1 (0)"`, `"brdiv-conf1 (1)"`).
+
+### `eval_egos_vs_heldouts`
+
+`eval_egos_vs_heldouts` vmaps over all ego agents in parallel against each heldout partner. The outer loop is a Python `for` over partners (necessary because each partner may have a different policy structure), while the inner evaluation is JAX-accelerated.
+
+```python
+def eval_egos_vs_heldouts(config, env, rng, num_episodes, ego_policy, ego_params,
+                          heldout_agent_list, heldout_agent_names=None, ego_test_mode=False):
+    '''Evaluate all ego agents against all heldout partners using vmap over egos.
+    Ego_params must be a pytree of shape (num_ego_agents, ...)
+    '''
+    num_ego_agents = jax.tree.leaves(ego_params)[0].shape[0]
+    num_partner_total = len(heldout_agent_list)
+
+    # Outer Python loop over heterogeneous heldout partners
+    all_metrics_for_partners = []
+    partner_rngs = jax.random.split(sub_rng, num_partner_total)
+
+    for partner_idx in range(num_partner_total):
+        heldout_policy, heldout_params, heldout_test_mode, heldout_performance_bounds = \
+            heldout_agent_list[partner_idx]
+
+        # vmap over the stacked ego agents and their RNGs
+        results_for_this_partner = jax.vmap(
+            func_to_vmap,
+            in_axes=(None, 0, 0)
+        )(ego_policy, ego_params, ego_rngs)
+
+        if config["global_heldout_settings"]["NORMALIZE_RETURNS"]:
+            if heldout_performance_bounds is not None:
+                results_for_this_partner = normalize_metrics(
+                    results_for_this_partner, heldout_performance_bounds)
+        all_metrics_for_partners.append(results_for_this_partner)
+
+    # Final shape: (num_egos, num_partners, num_episodes, num_agents_per_env)
+    final_metrics = tree_stack(all_metrics_for_partners)
+    final_metrics = jax.tree.map(lambda x: x.transpose(1, 0, 2, 3), final_metrics)
+    return final_metrics
+```
+
+The returned pytree has leaves shaped `(num_ego_agents, num_heldout_agents, num_eval_episodes, num_agents_per_env)`.
+
+### `run_heldout_evaluation`
+
+`run_heldout_evaluation` (in `evaluation/heldout_evaluator.py`) is the top-level entry point when you call `evaluation/run.py` directly. It handles environment creation, ego loading, heldout loading, and then delegates to `eval_egos_vs_heldouts`.
+
+```python
+def run_heldout_evaluation(config, print_metrics=False):
+    env = make_env(config["ENV_NAME"], config["ENV_KWARGS"])
+    env = LogWrapper(env)
+
+    rng = jax.random.PRNGKey(config["global_heldout_settings"]["EVAL_SEED"])
+    rng, ego_init_rng, heldout_init_rng, eval_rng = jax.random.split(rng, 4)
+
+    # Load ego agents from the path specified in config["ego_agent"]
+    ego_policy, ego_params, init_ego_params, ego_idx_labels = \
+        initialize_rl_agent_from_config(ego_agent_config, "ego", env, ego_init_rng)
+
+    # Load heldout partners
+    heldout_agents = load_heldout_set(
+        heldout_cfg, env, config["TASK_NAME"], config["ENV_KWARGS"], heldout_init_rng)
+
+    eval_metrics = eval_egos_vs_heldouts(
+        config, env, eval_rng,
+        config["global_heldout_settings"]["NUM_EVAL_EPISODES"],
+        ego_policy, flattened_ego_params,
+        heldout_agent_list, heldout_agent_names, ego_test_mode)
+
+    return eval_metrics
+```
+
+## Running evaluation
+
+<Steps>
+  <Step title="Download evaluation data">
+    Run the data download script from the repository root. You only need to do this once.
+
+    ```bash
+    python download_eval_data.py
+    ```
+  </Step>
+
+  <Step title="Point the config at your ego agent">
+    Edit `evaluation/configs/heldout_ego.yaml` and set the `ego_agent.path` field to the `saved_train_run` directory produced by your training run.
+
+    ```yaml
+    ego_agent:
+      path: results/lbf/lbf_7x7_nolevels/fcp/2025-05-01_12-00-00/saved_train_run
+      actor_type: mlp
+      idx_list: [[0, -1]]   # seed 0, last checkpoint
+      test_mode: false
+    ```
+
+    The `idx_list` field controls which checkpoints to evaluate. Use `[[seed, ckpt_idx]]` notation; `-1` refers to the last available checkpoint.
+  </Step>
+
+  <Step title="Run the evaluation script">
+    Pass your task to `evaluation/run.py` using Hydra's `task=` argument.
+
+    ```bash
+    python evaluation/run.py task=lbf/lbf_7x7_nolevels
+    ```
+
+    For Overcooked:
+
+    ```bash
+    python evaluation/run.py task=overcooked-v1/cramped_room
+    ```
+
+    The script dispatches based on the `name` field in the config. Configs whose `name` contains `heldout_ego` call `run_heldout_evaluation`; configs containing `heldout_xp` call `run_heldout_xp_evaluation`.
+  </Step>
+
+  <Step title="Inspect the printed table">
+    With `print_metrics=True` (the default in `run.py`), the script prints a `PrettyTable` showing the aggregate statistic and 95% confidence interval for each ego–partner combination:
+
+    ```
+    returned_episode_returns (mean ± CI):
+    +----------------+----------------------------+----------------------------+
+    | ---            | ippo_mlp (0)               | brdiv-conf1 (0)            |
+    +----------------+----------------------------+----------------------------+
+    | ego (0, -1)    | 0.82 (0.78, 0.86)          | 0.71 (0.67, 0.75)          |
+    +----------------+----------------------------+----------------------------+
+    ```
+  </Step>
+</Steps>
+
+## Cross-play (XP) matrix generation
+
+The cross-play matrix evaluates all held-out teammates against each other (and their best-response agents) to characterise how well each population member coordinates with partners outside its own training distribution.
+
+Run it with the `heldout_xp` config name:
+
+```bash
+python evaluation/run.py -cn heldout_xp task=lbf/lbf_7x7_nolevels
+```
+
+The `run_heldout_xp_evaluation` function in `evaluation/generate_xp_matrix.py` loads both the `heldout_set` and the `best_response_set` (which defaults to the same heldout set via `best_response_set: ${heldout_set}`), then runs every heldout agent (as row) against every best-response agent (as column).
+
+```python
+def run_heldout_xp_evaluation(config, print_metrics=False):
+    heldout_agents = load_heldout_set(
+        config["heldout_set"][config["TASK_NAME"]], ...)
+    br_agents = load_heldout_set(
+        config["best_response_set"][config["TASK_NAME"]], ...)
+
+    eval_metrics = heldout_crossplay(
+        config, env, eval_rng,
+        config["global_heldout_settings"]["NUM_EVAL_EPISODES"],
+        heldout_agents, br_agents)
+```
+
+With `print_metrics=True`, the result is printed as a table and also saved as a CSV file under the Hydra output directory. Pass `save_heatmap=True` to `print_metrics_table` if you also want a PNG heatmap of the matrix.
+
+<Note>
+Row normalisation in the XP matrix uses only the **row agent's** performance bounds, not the column agent's. If bounds are missing for a row agent, that entire row is skipped for normalisation and a warning is printed.
+</Note>
+
+## Episode visualisation
+
+To render or record a video of your ego agent cooperating with a teammate, use `evaluation/vis_episodes.py`. The script supports both LBF and Overcooked-v1 environments.
+
+```python
+from evaluation.vis_episodes import save_video
+from envs import make_env
+
+env = make_env("overcooked-v1", {"layout": "cramped_room"})
+
+save_video(
+    env=env,
+    env_name="overcooked-v1",
+    agent_0_param=ego_params,
+    agent_0_policy=ego_policy,
+    agent_1_param=partner_params,
+    agent_1_policy=partner_policy,
+    max_episode_steps=400,
+    num_eps=1,
+    savevideo=True,
+    save_dir="results/overcooked-v1/videos/",
+    save_name="ego-vs-partner",
+)
+```
+
+You can also run the script directly, pointing it at an existing training result:
+
+```bash
+python evaluation/vis_episodes.py results/overcooked-v1/counter_circuit/ippo/2025-04-22_15-46-55
+```
+
+The script collects environment states step-by-step (without JAX scan, so it can build a list of frames), then:
+
+- For LBF, saves an animated GIF/MP4 via `env.animate`.
+- For Overcooked-v1, uses `AdHocOvercookedVisualizer` to render an MP4 at 25 fps.
+
+Videos are written to the path constructed from `save_dir` and `save_name`.

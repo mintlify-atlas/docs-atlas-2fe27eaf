@@ -1,0 +1,237 @@
+---
+title: "Set up JaxAHT: conda, pip install, and evaluation data"
+description: "Learn how to create a conda environment, install via pip, verify JAX device access, and download heldout evaluation data on Linux and macOS."
+---
+
+This page walks you through every step needed to get JaxAHT running on your machine — from creating a conda environment with Python 3.11 to verifying your JAX device and downloading the evaluation agent dataset. Instructions cover both Linux with CUDA and macOS with CPU-only JAX. If you prefer not to use `pip install -e .`, an alternative path using `requirements.txt` is also described.
+
+## Standard installation
+
+<Steps>
+  <Step title="Create a conda environment">
+    JaxAHT requires **Python 3.11**. Create a new conda environment either in the default location or at a custom path.
+
+    <Tabs>
+      <Tab title="Default location">
+        ```bash
+        conda create --name jaxaht python=3.11
+        ```
+      </Tab>
+      <Tab title="Custom path">
+        ```bash
+        conda create --prefix /path/of/choice/jaxaht python=3.11
+        ```
+      </Tab>
+    </Tabs>
+
+    Then activate the environment:
+
+    ```bash
+    conda activate jaxaht
+    ```
+  </Step>
+
+  <Step title="Install the package">
+    Navigate to the repository root and install in development mode. `pyproject.toml` selects the correct JAX build for your platform automatically.
+
+    <Tabs>
+      <Tab title="Linux (CUDA 12)">
+        ```bash
+        pip install -e .
+        ```
+
+        This installs `jax[cuda12]==0.5.3` along with all other dependencies declared in `pyproject.toml`, including Flax, Optax, Jumanji, and JaxMARL.
+
+        <Note>
+          CUDA 12 must be present on the system. If your CUDA libraries are installed in a non-standard location, see the troubleshooting section below.
+        </Note>
+      </Tab>
+      <Tab title="macOS">
+        ```bash
+        pip install -e .
+        ```
+
+        On macOS, `pyproject.toml` selects the CPU-only build of JAX (`jax==0.5.3` without the CUDA extra). No additional flags are required.
+      </Tab>
+    </Tabs>
+
+    <Warning>
+      The `jumanji` package requires `pkg_resources`, which was removed in `setuptools>=81`. The `pyproject.toml` pins `setuptools<81` to prevent this, but if you encounter a `ModuleNotFoundError: No module named 'pkg_resources'` error, reinstall setuptools manually:
+
+      ```bash
+      python -m pip install "setuptools<81" --force-reinstall
+      python -m pip install -e .
+      ```
+    </Warning>
+  </Step>
+
+  <Step title="Verify your JAX device">
+    Confirm that JAX is importable and can see the expected device:
+
+    ```python
+    import jax
+    jax.devices()
+    ```
+
+    <Tabs>
+      <Tab title="Linux (CUDA 12)">
+        You should see output like:
+
+        ```
+        [CudaDevice(id=0)]
+        ```
+      </Tab>
+      <Tab title="macOS">
+        CPU-only JAX is expected on macOS:
+
+        ```
+        [CpuDevice(id=0)]
+        ```
+      </Tab>
+    </Tabs>
+  </Step>
+
+  <Step title="Download the evaluation data">
+    JaxAHT ships a download script that pulls heldout evaluation agents and pre-computed best-return baselines from Hugging Face. Run it from the repository root:
+
+    ```bash
+    python download_eval_data.py
+    ```
+
+    The script downloads and unpacks:
+
+    | Dataset | Destination |
+    |---------|-------------|
+    | Best heldout returns (`best_heldout_returns.zip`) | `results/` |
+    | LBF evaluation teammates | `eval_teammates/lbf/` |
+    | LBF 12×12 evaluation teammates | `eval_teammates/lbf_12x12/` |
+    | Overcooked-v1 evaluation teammates | `eval_teammates/overcooked-v1/` |
+
+    <Note>
+      Heuristic agents for LBF and Overcooked are already included in the repository under `agents/lbf/` and `agents/overcooked/`. The download script only fetches the RL-trained agent checkpoints.
+    </Note>
+  </Step>
+
+  <Step title="Verify the full installation">
+    Run the IPPO algorithm on the LBF task to confirm everything is working end to end:
+
+    ```bash
+    python marl/run.py task=lbf/lbf_7x7_nolevels algorithm=ippo/lbf/lbf_7x7_nolevels
+    ```
+
+    A successful run prints the resolved Hydra config followed by training metrics. By default, results are written to `results/` and logged to Weights & Biases.
+  </Step>
+</Steps>
+
+## Alternative: manual installation via requirements.txt
+
+If you prefer not to use `pip install -e .` or encounter issues with the editable install, you can install dependencies directly from `requirements.txt` and add the project to your `PYTHONPATH` manually.
+
+<Steps>
+  <Step title="Create and activate a conda environment">
+    Follow step 1 from the standard installation above.
+  </Step>
+
+  <Step title="Install from requirements.txt">
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+    `requirements.txt` mirrors the dependencies in `pyproject.toml` and includes the same platform-conditional JAX selectors.
+  </Step>
+
+  <Step title="Set PYTHONPATH as a conda environment variable">
+    Because you are not using an editable install, Python cannot find the project's internal modules unless you add the repository root to `PYTHONPATH`:
+
+    ```bash
+    conda env config vars set PYTHONPATH=/path/to/jax-aht
+    ```
+
+    Deactivate and reactivate the environment to apply the change:
+
+    ```bash
+    conda deactivate
+    conda activate jaxaht
+    ```
+
+    Verify the path is set:
+
+    ```bash
+    echo $PYTHONPATH
+    ```
+
+    To remove the variable later:
+
+    ```bash
+    conda env config vars unset PYTHONPATH
+    ```
+  </Step>
+
+  <Step title="Continue from the verification step">
+    Follow steps 3–5 of the standard installation to verify JAX, download evaluation data, and run the smoke-test command.
+  </Step>
+</Steps>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="JAX is not importable after installation">
+    Confirm that `pip` and `python` resolve to the same environment:
+
+    ```bash
+    which python
+    which pip
+    python -m pip --version
+    ```
+
+    If they point to different locations, reinstall using the explicit module form:
+
+    ```bash
+    python -m pip install -e .
+    ```
+  </Accordion>
+
+  <Accordion title="ModuleNotFoundError: No module named 'pkg_resources'">
+    This error occurs when `setuptools>=81` is installed. The `pkg_resources` module was removed in that release. Fix it by reinstalling a compatible version:
+
+    ```bash
+    python -m pip install "setuptools<81" --force-reinstall
+    python -m pip install -e .
+    ```
+  </Accordion>
+
+  <Accordion title="CUDA library not found at runtime">
+    If JAX cannot find CUDA even though the install succeeded, a conflicting `LD_LIBRARY_PATH` may be pointing to a system CUDA installation. Clear it and let JAX use the pip-installed CUDA libraries:
+
+    ```bash
+    export LD_LIBRARY_PATH=""
+    conda env config vars set LD_LIBRARY_PATH=
+    ```
+
+    The second command persists the empty value so it takes effect each time the conda environment is activated. Deactivate and reactivate for the change to apply.
+  </Accordion>
+
+  <Accordion title="Video export fails (ffmpeg not found)">
+    Some evaluation and test scripts save `.mp4` files and require the `ffmpeg` binary. Install it separately if you see errors related to video export:
+
+    <Tabs>
+      <Tab title="macOS">
+        ```bash
+        brew install ffmpeg
+        ```
+      </Tab>
+      <Tab title="Ubuntu / Debian">
+        ```bash
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg
+        ```
+      </Tab>
+    </Tabs>
+
+    Verify the installation:
+
+    ```bash
+    ffmpeg -version
+    ```
+  </Accordion>
+</AccordionGroup>

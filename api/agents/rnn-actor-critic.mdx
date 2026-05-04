@@ -1,0 +1,276 @@
+---
+title: "RNNActorCriticPolicy: recurrent agent architecture"
+description: "Reference for RNNActorCriticPolicy and S5ActorCriticPolicy: GRU and state-space model policies that maintain hidden state across timesteps in JaxAHT."
+---
+
+`RNNActorCriticPolicy` and `S5ActorCriticPolicy` extend `AgentPolicy` with a recurrent hidden state that persists across timesteps within an episode. Both policies accept the same `(seq_len, batch_size, ...)` shaped inputs as the MLP policy but additionally process a `done` flag to reset the carry at episode boundaries. Use a recurrent policy when the agent needs to integrate information over time — for example, to infer a teammate's type from interaction history.
+
+---
+
+## When to use RNN vs MLP
+
+| Situation | Recommended policy |
+|---|---|
+| Observation is Markov (fully sufficient at each step) | `MLPActorCriticPolicy` |
+| Optimal action depends on past observations | `RNNActorCriticPolicy` |
+| Very long episodes, complex temporal dependencies | `S5ActorCriticPolicy` |
+
+---
+
+## `RNNActorCriticPolicy`
+
+```python
+class RNNActorCriticPolicy(AgentPolicy)
+```
+
+Wraps `RNNActorCritic`, a Flax module that embeds the observation with one dense layer, feeds the embedding into a GRU cell via `ScannedRNN`, and then produces actor logits and a critic value from the GRU output.
+
+### Constructor
+
+```python
+RNNActorCriticPolicy(
+    action_dim,
+    obs_dim,
+    activation="tanh",
+    fc_hidden_dim=64,
+    gru_hidden_dim=64,
+)
+```
+
+<ParamField path="action_dim" type="int" required>
+  Number of discrete actions. Determines the output size of the actor head.
+</ParamField>
+
+<ParamField path="obs_dim" type="int" required>
+  Dimensionality of the flat observation vector. Used to build dummy inputs during parameter initialization.
+</ParamField>
+
+<ParamField path="activation" type="str" default='"tanh"'>
+  Activation applied after the embedding dense layer and after the post-GRU dense layers. Accepts `"tanh"` or `"relu"`. Defaults to `"tanh"`.
+</ParamField>
+
+<ParamField path="fc_hidden_dim" type="int" default="64">
+  Number of units in the observation embedding layer and the actor/critic dense layers that follow the GRU. Defaults to `64`.
+</ParamField>
+
+<ParamField path="gru_hidden_dim" type="int" default="64">
+  Dimensionality of the GRU hidden state. Also controls the output size of `ScannedRNN`. Defaults to `64`.
+</ParamField>
+
+### Methods
+
+#### `get_action`
+
+```python
+@partial(jax.jit, static_argnums=(0,))
+def get_action(
+    self, params, obs, done, avail_actions, hstate, rng,
+    aux_obs=None, env_state=None, test_mode=False
+) -> Tuple[int, chex.Array]
+```
+
+Processes a sequence of observations through the GRU and returns a sampled (or greedy) action along with the updated hidden state.
+
+**Shape conventions:**
+- `obs`: `(seq_len, batch_size, obs_dim)`
+- `done`: `(seq_len, batch_size)`
+- `avail_actions`: `(seq_len, batch_size, action_dim)` or `(action_dim,)`
+- `hstate`: `(1, batch_size, gru_hidden_dim)` — the leading `1` is maintained for training-code compatibility
+
+The returned `new_hstate` has shape `(1, batch_size, gru_hidden_dim)`.
+
+#### `get_action_value_policy`
+
+```python
+@partial(jax.jit, static_argnums=(0,))
+def get_action_value_policy(
+    self, params, obs, done, avail_actions, hstate, rng,
+    aux_obs=None, env_state=None
+) -> Tuple[int, chex.Array, distrax.Distribution, chex.Array]
+```
+
+Returns the action, scalar value estimate, `distrax.Categorical` policy distribution, and updated hidden state. Used by PPO during the learning update.
+
+#### `init_hstate`
+
+```python
+def init_hstate(self, batch_size, aux_info=None) -> chex.Array
+```
+
+Creates a zeroed GRU carry for `batch_size` parallel environments.
+
+<ParamField path="batch_size" type="int" required>
+  Number of parallel environments to initialize hidden state for.
+</ParamField>
+
+<ParamField path="aux_info" type="dict">
+  Unused by `RNNActorCriticPolicy`. Present for interface compatibility with heuristic agents that need an agent ID. Defaults to `None`.
+</ParamField>
+
+Returns an array of shape `(1, batch_size, gru_hidden_dim)` filled with zeros.
+
+#### `init_params`
+
+```python
+def init_params(self, rng) -> dict
+```
+
+Initializes network parameters by running a dummy forward pass with a single time step and a batch size of one.
+
+---
+
+## Network architecture
+
+```
+obs ──► Dense(fc_hidden_dim) ──► activation ──► ScannedRNN (GRU, gru_hidden_dim)
+                                                    │
+                                    ┌───────────────┴───────────────┐
+                                    ▼                               ▼
+                           Dense(gru_hidden_dim)           Dense(fc_hidden_dim)
+                           activation                      activation
+                           Dense(action_dim)               Dense(1)
+                           mask unavail                    squeeze
+                           Categorical(logits)             value scalar
+```
+
+`ScannedRNN` uses `jax.lax.scan` to roll the GRU cell over the time dimension efficiently. When `done[t]` is `True` for an environment, the carry for that environment is reset to zeros before the GRU cell processes timestep `t+1`.
+
+---
+
+## Instantiation example
+
+```python
+import jax
+import jax.numpy as jnp
+from agents.rnn_actor_critic_agent import RNNActorCriticPolicy
+
+rng = jax.random.PRNGKey(0)
+
+policy = RNNActorCriticPolicy(
+    action_dim=6,
+    obs_dim=96,
+    activation="tanh",
+    fc_hidden_dim=64,
+    gru_hidden_dim=64,
+)
+
+params = policy.init_params(rng)
+
+# Initialize hidden state for 4 parallel environments
+hstate = policy.init_hstate(batch_size=4)
+# hstate shape: (1, 4, 64)
+
+# During rollout — obs shape: (seq_len=1, batch_size=4, obs_dim)
+obs = jnp.zeros((1, 4, 96))
+done = jnp.zeros((1, 4), dtype=bool)
+avail_actions = jnp.ones((1, 4, 6))
+
+rng, act_rng = jax.random.split(rng)
+action, new_hstate = policy.get_action(
+    params, obs, done, avail_actions, hstate, act_rng
+)
+# new_hstate shape: (1, 4, 64)
+```
+
+---
+
+## `S5ActorCriticPolicy`
+
+`S5ActorCriticPolicy` replaces the GRU with a stack of S5 state-space model (SSM) layers. S5 uses a parallel associative scan over the time dimension, which can be more efficient than sequential GRU unrolling on modern accelerators for long sequences.
+
+```python
+class S5ActorCriticPolicy(AgentPolicy)
+```
+
+### Constructor
+
+```python
+S5ActorCriticPolicy(
+    action_dim,
+    obs_dim,
+    d_model=16,
+    ssm_size=16,
+    ssm_n_layers=2,
+    blocks=1,
+    fc_hidden_dim=64,
+    fc_n_layers=2,
+    s5_activation="full_glu",
+    s5_do_norm=True,
+    s5_prenorm=True,
+    s5_do_gtrxl_norm=True,
+    s5_no_reset=False,
+)
+```
+
+<ParamField path="action_dim" type="int" required>
+  Number of discrete actions.
+</ParamField>
+
+<ParamField path="obs_dim" type="int" required>
+  Dimensionality of the flat observation vector.
+</ParamField>
+
+<ParamField path="d_model" type="int" default="16">
+  Feature dimension of each S5 sequence layer (referred to as `H` in the S5 paper). Defaults to `16`; larger values like `128` or `512` are used in practice.
+</ParamField>
+
+<ParamField path="ssm_size" type="int" default="16">
+  State-space size `P` of the S5 SSM before conjugate symmetry halving. Defaults to `16`.
+</ParamField>
+
+<ParamField path="ssm_n_layers" type="int" default="2">
+  Number of stacked S5 `SequenceLayer` blocks. Defaults to `2`.
+</ParamField>
+
+<ParamField path="blocks" type="int" default="1">
+  Number of diagonal blocks to split the SSM parameters into. Defaults to `1`.
+</ParamField>
+
+<ParamField path="fc_hidden_dim" type="int" default="64">
+  Hidden dimension for the fully-connected actor and critic heads. Defaults to `64`; `1024` is a common production value.
+</ParamField>
+
+<ParamField path="fc_n_layers" type="int" default="2">
+  Number of dense layers in each of the actor and critic heads. Defaults to `2`.
+</ParamField>
+
+<ParamField path="s5_activation" type="str" default='"full_glu"'>
+  Activation type inside each S5 layer. Options: `"full_glu"`, `"half_glu1"`, `"half_glu2"`, `"gelu"`, `"relu"`. Defaults to `"full_glu"`.
+</ParamField>
+
+<ParamField path="s5_do_norm" type="bool" default="True">
+  Whether to apply layer normalization inside S5 sequence layers.
+</ParamField>
+
+<ParamField path="s5_prenorm" type="bool" default="True">
+  When `True`, applies layer norm before the SSM (pre-norm). When `False`, applies it after (post-norm).
+</ParamField>
+
+<ParamField path="s5_do_gtrxl_norm" type="bool" default="True">
+  Whether to apply an additional GTrXL-style layer norm after the SSM output.
+</ParamField>
+
+<ParamField path="s5_no_reset" type="bool" default="False">
+  When `True`, the `done` signal is ignored and the hidden state is never reset at episode boundaries. Useful for ablations.
+</ParamField>
+
+### `init_hstate`
+
+```python
+def init_hstate(self, batch_size, aux_info=None) -> list
+```
+
+Returns a list of `ssm_n_layers` complex-valued zero arrays, each of shape `(1, batch_size, ssm_size // 2)`. The S5 hidden state is stored as a list because each layer has its own carry.
+
+<Note>
+Unlike `RNNActorCriticPolicy`, the S5 hidden state is a Python list of JAX arrays, not a single array. Training and evaluation code must handle this structure when stacking or slicing across seeds.
+</Note>
+
+---
+
+## Related pages
+
+- [AgentPolicy interface](/api/agent-interface) — abstract base class all policies implement
+- [MLP actor-critic](/api/agents/mlp-actor-critic) — stateless feed-forward alternative
+- [Heuristic agents](/api/agents/heuristic-agents) — rule-based partners for LBF and Overcooked
+- [Common utilities](/api/utilities/common) — `run_episodes` and checkpoint helpers

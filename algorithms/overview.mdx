@@ -1,0 +1,84 @@
+---
+title: "Overview of the four algorithm categories in JaxAHT"
+description: "Survey the four algorithm categories in JaxAHT—ego training, teammate generation, MARL, and open-ended training—and how they compose into pipelines."
+---
+
+JaxAHT organizes its algorithms into four categories that map to the full lifecycle of ad hoc teamwork research. Each category addresses a distinct stage: training a team from scratch with MARL, generating a diverse pool of training partners, training an ego agent against that pool, or jointly evolving both the agent and its environment. Understanding how these categories relate to each other is key to assembling the right pipeline for your research question.
+
+## The four categories
+
+**MARL** trains a homogeneous team of agents from scratch using Independent PPO (IPPO). It is the simplest entry point and also serves as the teammate-generation subroutine inside FCP.
+
+**Teammate generation** methods produce a diverse population of partners for use in ego agent training. All four methods (FCP, BRDiv, LBRDiv, CoMeDi) output a set of partner checkpoints that you then feed into an ego training run.
+
+**Ego agent training** takes a fixed partner population as input and trains a single agent—the ego agent—to work well with any member of that population. PPO Ego, LIAM, and MeLIBA are the three ego training algorithms available. Both teammate generation pipelines and open-ended training pipelines call ego training as a subroutine.
+
+**Open-ended training** goes a step further by jointly optimizing the ego agent alongside an adversarial partner that actively tries to expose the ego's weaknesses. ROTATE, PAIRED, and Minimax Return belong to this category.
+
+## How the categories compose
+
+Algorithms from MARL and ego agent training are called as subroutines by the other two categories:
+
+- FCP uses `marl/ippo.py` to generate diverse partner checkpoints across different seeds.
+- All two-stage teammate generation methods use `ego_agent_training/ppo_ego.py` to train the ego agent after partner generation is complete.
+- Open-ended training methods run their own inner loops but share the same ego agent interface.
+
+## Algorithm table
+
+| Category | Algorithm | Description | Paper |
+|---|---|---|---|
+| Ego agent training | PPO Ego | Trains a recurrent PPO agent against a fixed partner population. | — |
+| Ego agent training | LIAM | Adds a teammate-modelling encoder-decoder on top of PPO. | [Papoudakis et al. 2021](https://arxiv.org/abs/2006.09447) |
+| Ego agent training | MeLIBA | Uses a variational encoder to infer a latent teammate embedding via an ELBO objective. | [Zintgraf et al. 2022](https://arxiv.org/abs/2101.03864) |
+| Teammate generation | FCP | Collects checkpoints from multiple IPPO seeds to build a diverse partner pool. | [Strouse et al. 2021](https://proceedings.neurips.cc/paper/2021/hash/797134c3e42371bb4979a462eb2f042a-Abstract.html) |
+| Teammate generation | BRDiv | Trains partner agents to be mutually diverse via a best-response diversity objective. | [Rahman et al. 2022](https://arxiv.org/abs/2207.14138) |
+| Teammate generation | LBRDiv | Extends BRDiv to emulate the minimum coverage set. | [Rahman et al. 2024](https://arxiv.org/abs/2308.09595) |
+| Teammate generation | CoMeDi | Optimizes partner diversity through mixed-play. | [Sarkar et al. 2023](https://arxiv.org/pdf/2310.15414) |
+| MARL | IPPO | Independent PPO with parameter sharing across agents. | [Yu et al. 2022](https://arxiv.org/abs/2103.01955) |
+| Open-ended training | ROTATE | Cooperative regret maximization between ego and adversarial partner. | [Wang et al. 2025](https://arxiv.org/abs/2505.23686) |
+| Open-ended training | PAIRED | Unsupervised environment design adapted for AHT. | [Dennis et al. 2020](https://arxiv.org/abs/2012.02096) |
+| Open-ended training | Minimax Return | Open-ended baseline that minimizes the worst-case ego return. | — |
+
+## Entry points
+
+Every category has a `run.py` that acts as the single entry point for all algorithms in that category. Hydra manages configuration; you select the algorithm and task via command-line overrides.
+
+```bash
+# MARL
+python marl/run.py task=lbf/lbf_7x7_nolevels algorithm=ippo/lbf/lbf_7x7_nolevels
+
+# Teammate generation
+python teammate_generation/run.py task=lbf/lbf_7x7_nolevels algorithm=fcp/lbf/lbf_7x7_nolevels
+
+# Ego agent training
+python ego_agent_training/run.py task=lbf/lbf_7x7_nolevels algorithm=ppo_ego/lbf/lbf_7x7_nolevels
+
+# Open-ended training
+python open_ended_training/run.py task=lbf/lbf_7x7_nolevels algorithm=rotate/lbf/lbf_7x7_nolevels
+```
+
+Config files live under `configs/algorithm/` and `configs/task/` within each directory and are merged at runtime by Hydra into a master config. You can override any value from the command line:
+
+```bash
+python teammate_generation/run.py \
+    task=lbf/lbf_7x7_nolevels \
+    algorithm=fcp/lbf/lbf_7x7_nolevels \
+    algorithm.TOTAL_TIMESTEPS=1e5
+```
+
+## Category pages
+
+<CardGroup cols={2}>
+  <Card title="Ego agent training" icon="robot" href="/algorithms/ego-agent-training">
+    PPO, LIAM, and MeLIBA for training against a fixed partner population.
+  </Card>
+  <Card title="Teammate generation" icon="users" href="/algorithms/teammate-generation">
+    FCP, BRDiv, LBRDiv, and CoMeDi for building diverse partner pools.
+  </Card>
+  <Card title="MARL with IPPO" icon="network" href="/algorithms/marl">
+    Independent PPO with parameter sharing for fully cooperative tasks.
+  </Card>
+  <Card title="Open-ended training" icon="infinity" href="/algorithms/open-ended-training">
+    ROTATE, PAIRED, and Minimax Return for jointly evolving agent and environment.
+  </Card>
+</CardGroup>

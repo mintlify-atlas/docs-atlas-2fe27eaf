@@ -1,0 +1,274 @@
+---
+title: "AgentPopulation: batched sampling from agent pools"
+description: "Reference for the AgentPopulation class, which stores a bank of agent policies and samples from them to populate parallel training environments."
+---
+
+`AgentPopulation` wraps an `AgentPolicy` instance and a parameter bank to represent a fixed-size population of homogeneous agents. Training algorithms such as FCP and BRDiv maintain a population of distinct policies; `AgentPopulation` gives them a single object to query for actions across many parallel environments, each of which may be paired with a different member of the population.
+
+<Note>
+The current implementation supports only **homogeneous** populations — all agents share the same network architecture (the same `policy_cls`). Heterogeneous populations are planned for a future release.
+</Note>
+
+## Class definition
+
+```python
+class AgentPopulation:
+    def __init__(self, pop_size, policy_cls): ...
+    def sample_agent_indices(self, n, rng): ...
+    def gather_agent_params(self, pop_params, agent_indices): ...
+    def get_actions(self, pop_params, agent_indices, obs, done, avail_actions,
+                    hstate, rng, env_state=None, aux_obs=None, test_mode=False): ...
+    def init_hstate(self, n, aux_info=None): ...
+```
+
+---
+
+## `__init__`
+
+```python
+def __init__(self, pop_size, policy_cls)
+```
+
+Creates a population handle. This constructor does **not** allocate parameter memory — use `policy_cls.init_params` inside a `jax.vmap` to build the actual `pop_params` pytree before calling any other methods.
+
+<ParamField path="pop_size" type="int" required>
+  The number of agents in the population.
+</ParamField>
+
+<ParamField path="policy_cls" type="AgentPolicy" required>
+  An instantiated `AgentPolicy` object. All population members share this network architecture. The instance is used directly when calling `policy_cls.get_action` inside `get_actions`.
+</ParamField>
+
+---
+
+## `pop_params` pytree structure
+
+Every method that operates on population parameters expects `pop_params` — a pytree whose **leading axis is `pop_size`**. Each leaf tensor has shape `(pop_size, ...)` where `...` matches the shape of the corresponding parameter in a single agent's parameter tree.
+
+You build `pop_params` by vmapping `init_params` over a batch of random keys:
+
+```python
+import jax
+import jax.numpy as jnp
+from agents.mlp_actor_critic_agent import MLPActorCriticPolicy
+from agents.population_interface import AgentPopulation
+
+policy = MLPActorCriticPolicy(action_dim=6, obs_dim=48)
+population = AgentPopulation(pop_size=4, policy_cls=policy)
+
+rng = jax.random.PRNGKey(0)
+rng, *member_rngs = jax.random.split(rng, population.pop_size + 1)
+
+# Each member gets its own random initialization
+pop_params = jax.vmap(policy.init_params)(jnp.array(member_rngs))
+# pop_params leaves now have shape (4, ...)
+```
+
+---
+
+## `sample_agent_indices`
+
+```python
+def sample_agent_indices(self, n, rng)
+```
+
+Draws `n` agent indices uniformly **with replacement** from `[0, pop_size)`. Use this at the start of each rollout to assign a population member to each parallel environment.
+
+<ParamField path="n" type="int" required>
+  The number of indices to sample — typically equal to `num_envs`.
+</ParamField>
+
+<ParamField path="rng" type="jax.random.PRNGKey" required>
+  A JAX random key.
+</ParamField>
+
+### Returns
+
+<ResponseField name="agent_indices" type="jnp.ndarray">
+  An integer array of shape `(n,)` with values in `[0, pop_size)`.
+</ResponseField>
+
+---
+
+## `gather_agent_params`
+
+```python
+def gather_agent_params(self, pop_params, agent_indices)
+```
+
+Selects the parameters of the agents specified by `agent_indices` from the full population parameter bank. The output has the same pytree structure as `pop_params` but with leading axis `num_envs` instead of `pop_size`.
+
+Internally, this applies `jax.vmap(lambda idx: leaf[idx])(agent_indices)` to every leaf in the pytree, so the gather is fully JIT-compatible.
+
+<ParamField path="pop_params" type="pytree" required>
+  Population parameter pytree with leaves of shape `(pop_size, ...)`.
+</ParamField>
+
+<ParamField path="agent_indices" type="jnp.ndarray" required>
+  Integer indices of shape `(num_envs,)`, each in `[0, pop_size)`, produced by `sample_agent_indices`.
+</ParamField>
+
+### Returns
+
+<ResponseField name="gathered_params" type="pytree">
+  A pytree with the same structure as `pop_params` but leaves of shape `(num_envs, ...)`, one entry per environment.
+</ResponseField>
+
+---
+
+## `get_actions`
+
+```python
+def get_actions(
+    self,
+    pop_params,
+    agent_indices,
+    obs,
+    done,
+    avail_actions,
+    hstate,
+    rng,
+    env_state=None,
+    aux_obs=None,
+    test_mode=False,
+)
+```
+
+The primary rollout method. It gathers the per-environment parameters, splits `rng` into one key per environment, and vmaps `policy_cls.get_action` across all environments in a single call.
+
+<ParamField path="pop_params" type="pytree" required>
+  Population parameter pytree with leaves of shape `(pop_size, ...)`.
+</ParamField>
+
+<ParamField path="agent_indices" type="jnp.ndarray" required>
+  Integer indices of shape `(num_envs,)` produced by `sample_agent_indices`.
+</ParamField>
+
+<ParamField path="obs" type="chex.Array" required>
+  Batched observations of shape `(num_envs, obs_dim)`.
+</ParamField>
+
+<ParamField path="done" type="chex.Array" required>
+  Done flags of shape `(num_envs,)`.
+</ParamField>
+
+<ParamField path="avail_actions" type="chex.Array" required>
+  Binary action masks of shape `(num_envs, action_dim)`.
+</ParamField>
+
+<ParamField path="hstate" type="chex.Array" required>
+  Batched hidden state of shape `(num_envs, ...)`, or `None` for stateless policies.
+</ParamField>
+
+<ParamField path="rng" type="jax.random.PRNGKey" required>
+  A single random key that is split into `num_envs` per-environment keys internally.
+</ParamField>
+
+<ParamField path="env_state" type="chex.Array">
+  Batched environment states, or `None` if the policy does not use privileged state. Defaults to `None`.
+</ParamField>
+
+<ParamField path="aux_obs" type="chex.Array">
+  Optional auxiliary observations passed through to `policy_cls.get_action`. Defaults to `None`.
+</ParamField>
+
+<ParamField path="test_mode" type="bool" default="False">
+  When `True`, each agent selects the mode (greedy) action instead of sampling.
+</ParamField>
+
+### Returns
+
+<ResponseField name="actions" type="jnp.ndarray">
+  Selected actions for all environments, shape `(num_envs,)`.
+</ResponseField>
+
+<ResponseField name="new_hstate" type="chex.Array">
+  Updated hidden states of shape `(num_envs, ...)`, or `None` for stateless policies.
+</ResponseField>
+
+---
+
+## `init_hstate`
+
+```python
+def init_hstate(self, n: int, aux_info: dict = None)
+```
+
+Delegates to `policy_cls.init_hstate(n, aux_info)` to create an initial hidden state for `n` environments. Returns `None` for stateless (MLP) policies.
+
+<ParamField path="n" type="int" required>
+  The number of environments (or agents) to initialize hidden state for.
+</ParamField>
+
+<ParamField path="aux_info" type="dict">
+  Optional auxiliary information forwarded to the underlying policy's `init_hstate`. Defaults to `None`.
+</ParamField>
+
+### Returns
+
+<ResponseField name="hstate" type="chex.Array">
+  Initial hidden state of shape `(n, ...)`, or `None` for stateless policies.
+</ResponseField>
+
+---
+
+## Usage example
+
+The following example shows the pattern used by training algorithms that maintain a partner population and pair each parallel environment with a randomly sampled partner.
+
+```python
+import jax
+import jax.numpy as jnp
+from agents.mlp_actor_critic_agent import MLPActorCriticPolicy
+from agents.population_interface import AgentPopulation
+
+# --- Setup ---
+POP_SIZE = 8
+NUM_ENVS = 16
+OBS_DIM = 48
+ACTION_DIM = 6
+
+rng = jax.random.PRNGKey(42)
+policy = MLPActorCriticPolicy(action_dim=ACTION_DIM, obs_dim=OBS_DIM)
+population = AgentPopulation(pop_size=POP_SIZE, policy_cls=policy)
+
+# Build the population parameter bank
+rng, *init_rngs = jax.random.split(rng, POP_SIZE + 1)
+pop_params = jax.vmap(policy.init_params)(jnp.array(init_rngs))
+
+# Initialize hidden state (None for MLP)
+hstate = population.init_hstate(NUM_ENVS)
+
+# --- Rollout loop ---
+rng, sample_rng, act_rng = jax.random.split(rng, 3)
+
+# Sample which population member partners each environment this episode
+agent_indices = population.sample_agent_indices(NUM_ENVS, sample_rng)
+
+# Dummy observation and mask (replace with actual env outputs)
+obs = jnp.zeros((NUM_ENVS, OBS_DIM))
+done = jnp.zeros((NUM_ENVS,), dtype=bool)
+avail_actions = jnp.ones((NUM_ENVS, ACTION_DIM))
+
+# Get actions for all environments in one call
+actions, hstate = population.get_actions(
+    pop_params,
+    agent_indices,
+    obs,
+    done,
+    avail_actions,
+    hstate,
+    act_rng,
+)
+# actions.shape == (NUM_ENVS,)
+```
+
+<Tip>
+Re-sample `agent_indices` once per episode (at reset), not once per step, so that each environment interacts with the same partner throughout the episode.
+</Tip>
+
+## Related pages
+
+- [AgentPolicy](/api/agent-interface) — the single-agent interface that `AgentPopulation` wraps
+- [MLP Actor-Critic](/api/agents/mlp-actor-critic) — a concrete stateless policy compatible with `AgentPopulation`
+- [RNN Actor-Critic](/api/agents/rnn-actor-critic) — a concrete recurrent policy compatible with `AgentPopulation`

@@ -1,0 +1,138 @@
+---
+title: "Multi-agent reinforcement learning with IPPO in JaxAHT"
+description: "Train cooperative teams from scratch with Independent PPO and parameter sharing, or use IPPO as the partner-generation subroutine inside FCP."
+---
+
+JaxAHT's MARL category currently implements a single algorithm: Independent PPO (IPPO) with parameter sharing. You can run IPPO standalone to train a cooperative team from scratch, or it runs automatically as the partner generation subroutine when you use Fictitious Co-Play (FCP). The implementation is based on the JaxMARL IPPO baseline and is adapted to JaxAHT's shared agent interface.
+
+## How IPPO works
+
+IPPO trains all agents independently: each agent treats its teammates as part of the environment and optimizes its own PPO objective without access to other agents' observations or gradients. Parameter sharing is on by default—all agents share a single set of network weights, which reduces sample complexity and enforces symmetry across agents.
+
+The training loop JIT-compiles the full rollout and update cycle with `jax.jit(jax.vmap(...))`, running multiple independent seeds in parallel across a single device.
+
+Key design choices in the JaxAHT implementation:
+
+- **Available actions masking** — the environment exposes `get_avail_actions()` and the policy applies a large negative logit to unavailable actions before sampling.
+- **Checkpoint saving** — IPPO saves `NUM_CHECKPOINTS` parameter snapshots evenly spaced across training, which FCP then uses as its partner population.
+- **Metrics** — all metrics are logged via `jax.experimental.io_callback` at each update step so they appear in real time in Weights & Biases.
+
+## Run commands
+
+<Tabs>
+  <Tab title="LBF">
+    ```bash
+    # LBF 7x7, no levels
+    python marl/run.py \
+        task=lbf/lbf_7x7_nolevels \
+        algorithm=ippo/lbf/lbf_7x7_nolevels
+
+    # LBF 12x12, with levels
+    python marl/run.py \
+        task=lbf/lbf_12x12 \
+        algorithm=ippo/lbf/lbf_12x12
+    ```
+  </Tab>
+  <Tab title="Overcooked">
+    ```bash
+    # Cramped room
+    python marl/run.py \
+        task=overcooked-v1/cramped_room \
+        algorithm=ippo/overcooked-v1/cramped_room
+
+    # Asymmetric advantages
+    python marl/run.py \
+        task=overcooked-v1/asymm_advantages \
+        algorithm=ippo/overcooked-v1/asymm_advantages
+
+    # Coordination ring
+    python marl/run.py \
+        task=overcooked-v1/coord_ring \
+        algorithm=ippo/overcooked-v1/coord_ring
+    ```
+  </Tab>
+</Tabs>
+
+## Key config parameters
+
+The IPPO config is located at `marl/configs/algorithm/ippo/<task>.yaml` and inherits from a `_base_.yaml`. The most important parameters are:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `TOTAL_TIMESTEPS` | `1e7` | Total environment steps across all envs and seeds. |
+| `NUM_ENVS` | `8` | Number of parallel environments per seed. |
+| `NUM_SEEDS` | `3` | Number of independent training seeds run in parallel. |
+| `LR` | `1e-4` | Adam learning rate. |
+| `ROLLOUT_LENGTH` | task-dependent | Steps per rollout before a PPO update. |
+| `NUM_MINIBATCHES` | `4` | Number of minibatches per PPO epoch. |
+| `UPDATE_EPOCHS` | `15` | Number of PPO epochs per update. |
+| `GAMMA` | `0.99` | Discount factor. |
+| `GAE_LAMBDA` | `0.95` | GAE lambda for advantage estimation. |
+| `CLIP_EPS` | `0.05` | PPO clipping epsilon. |
+| `ENT_COEF` | `0.01` | Entropy regularization coefficient. |
+| `VF_COEF` | `0.5` | Value function loss coefficient. |
+| `MAX_GRAD_NORM` | `1.0` | Gradient clipping norm. |
+| `ANNEAL_LR` | `true` | Whether to linearly anneal the learning rate to zero. |
+| `NUM_CHECKPOINTS` | `5` | Number of parameter snapshots to save during training. |
+| `ACTOR_TYPE` | `mlp` | Network architecture: `mlp`, `rnn`, or `s5`. |
+
+You can override any parameter from the command line:
+
+```bash
+python marl/run.py \
+    task=lbf/lbf_7x7_nolevels \
+    algorithm=ippo/lbf/lbf_7x7_nolevels \
+    algorithm.TOTAL_TIMESTEPS=2e7 \
+    algorithm.NUM_SEEDS=1 \
+    label=longer_run
+```
+
+## IPPO as a subroutine in FCP
+
+When you run FCP, the teammate generation pipeline calls `marl/ippo.py`'s `make_train` function directly—no separate invocation of `marl/run.py` is needed. FCP vmaps over `PARTNER_POP_SIZE` independent IPPO training runs and collects `NUM_CHECKPOINTS` snapshots from each run:
+
+```python
+# From teammate_generation/fcp.py
+from marl.ippo import make_train as make_ppo_train
+
+def train_fcp_partners(rng, env, algorithm_config, wandb_logger):
+    rngs = jax.random.split(rng, algorithm_config["PARTNER_POP_SIZE"])
+    train_jit = jax.jit(jax.vmap(make_ppo_train(algorithm_config, env, logger=wandb_logger)))
+    out = train_jit(rngs)
+    return out
+```
+
+The resulting partner population has `PARTNER_POP_SIZE × NUM_CHECKPOINTS` members. This is handled transparently when you run:
+
+```bash
+python teammate_generation/run.py \
+    task=lbf/lbf_7x7_nolevels \
+    algorithm=fcp/lbf/lbf_7x7_nolevels \
+    train_ego=true
+```
+
+## Run and visualize
+
+<Steps>
+  <Step title="Run IPPO training">
+    ```bash
+    python marl/run.py \
+        task=lbf/lbf_7x7_nolevels \
+        algorithm=ippo/lbf/lbf_7x7_nolevels \
+        label=ippo_lbf
+    ```
+    Metrics are logged to Weights & Biases under the project specified in `marl/configs/base_config_marl.yaml`. Results and checkpoints are saved locally to the Hydra output directory (by default `results/`).
+  </Step>
+  <Step title="View training curves">
+    Open your Weights & Biases project to view `Train/returned_episode_returns` and other metrics. All metrics are logged at each update step via `io_callback`, so curves update in real time during training.
+  </Step>
+  <Step title="Load a checkpoint for evaluation">
+    Saved checkpoints can be loaded by pointing an ego training run's partner config at the output directory:
+    ```bash
+    python ego_agent_training/run.py \
+        algorithm=ppo_ego/lbf/lbf_7x7_nolevels \
+        task=lbf/lbf_7x7_nolevels \
+        algorithm.partner_agent.ippo.path=results/<run_dir>/saved_train_run/
+    ```
+  </Step>
+</Steps>

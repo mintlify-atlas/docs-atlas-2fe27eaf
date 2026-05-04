@@ -1,0 +1,196 @@
+---
+title: "Overcooked-v1 cooperative cooking task and layouts"
+description: "Overcooked-v1 kitchen layouts, initialization parameters, reward shaping coefficients, and the JaxMARL modifications made in JaxAHT's OvercookedV1 wrapper."
+---
+
+Overcooked-v1 is a cooperative cooking task where two agents must coordinate to prepare and deliver onion soup. Agents pick up onions, place them into pots, wait for soup to cook, collect it with a plate, and deliver it to the goal counter. JaxAHT wraps a modified version of the [JaxMARL](https://github.com/FLAIROx/JaxMARL) Overcooked environment that fixes initialization issues and adds additional reward shaping parameters.
+
+<Note>
+JaxAHT introduces two important behavioral changes to the JaxMARL Overcooked environment. First, the `random_reset` flag now controls only agent starting positions, not object state. A separate `random_obj_state` flag controls whether pots and agent inventories are randomized. Second, when a map has disconnected regions, agents are guaranteed to spawn in separate components so the task is always solvable.
+</Note>
+
+## Task description
+
+Each episode, two agents operate in a kitchen defined by a fixed layout. To score, an agent must:
+
+1. Pick up an onion from an onion pile.
+2. Place it in a pot (three onions fill the pot).
+3. Wait for the pot to finish cooking (countdown timer reaches zero).
+4. Pick up a plate from the plate pile.
+5. Collect the finished soup from the pot.
+6. Deliver the soup dish to the goal counter.
+
+Each delivery scores 20 reward points. Both agents share the same reward signal. The episode ends after `max_steps` steps (default 400).
+
+## Layout variants
+
+Five kitchen layouts are available:
+
+| Layout name | Description |
+|---|---|
+| `cramped_room` | Small, open room. Agents share a tight space and must avoid blocking each other. |
+| `asymm_advantages` | Asymmetric layout where each agent has faster access to different resources. |
+| `coord_ring` | Ring-shaped corridor. Efficient coordination requires agents to move in complementary directions. |
+| `counter_circuit` | A counter runs through the center. Agents must use the counter to hand off objects. |
+| `forced_coord` | A dividing wall forces strict role separation — only one agent can reach each resource type. |
+
+## Creating an Overcooked environment
+
+Use `make_env()` with the env name `'overcooked-v1'` and a required `layout` key:
+
+```python
+from envs import make_env
+
+# Cramped room with default settings
+env = make_env('overcooked-v1', {'layout': 'cramped_room'})
+
+# Asymmetric advantages with randomized agent positions
+env = make_env('overcooked-v1', {
+    'layout': 'asymm_advantages',
+    'random_reset': True,
+    'random_obj_state': False,
+    'max_steps': 400,
+})
+
+# Forced coordination layout with reward shaping enabled
+env = make_env('overcooked-v1', {
+    'layout': 'forced_coord',
+    'random_reset': True,
+    'do_reward_shaping': True,
+    'reward_shaping_params': {
+        'PLACEMENT_IN_POT_REW': 3,
+        'PLATE_PICKUP_REWARD': 3,
+        'SOUP_PICKUP_REWARD': 5,
+    }
+})
+```
+
+To run a basic environment loop:
+
+```python
+import jax
+from envs import make_env
+
+env = make_env('overcooked-v1', {'layout': 'cramped_room'})
+
+key = jax.random.PRNGKey(0)
+key, reset_key = jax.random.split(key)
+
+obs, state = env.reset(reset_key)
+
+for _ in range(20):
+    key, step_key = jax.random.split(key)
+    actions = {
+        agent: jax.random.randint(step_key, (), 0, len(env.env.action_set))
+        for agent in env.agents
+    }
+    obs, state, rewards, dones, info = env.step(step_key, state, actions)
+    if dones['__all__']:
+        break
+```
+
+## Configuration parameters
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `layout` | `str` | required | Kitchen layout name. One of `asymm_advantages`, `coord_ring`, `counter_circuit`, `cramped_room`, `forced_coord`. |
+| `random_reset` | `bool` | `True` | Randomize agent starting positions each episode. When `False`, agents spawn at fixed layout positions. |
+| `random_obj_state` | `bool` | `False` | Randomize initial pot fill state and agent inventories. Independent of `random_reset`. |
+| `max_steps` | `int` | `400` | Maximum number of steps per episode. |
+| `do_reward_shaping` | `bool` | `False` | Add dense shaping rewards on top of the delivery reward. |
+| `reward_shaping_params` | `dict` | `{}` | Override individual reward shaping coefficients (see [Reward shaping](#reward-shaping)). |
+
+## Action and observation spaces
+
+Each agent has 6 discrete actions: move up, move down, move left, move right, stay, and interact. All actions are always available, so `get_avail_actions()` returns an all-ones mask:
+
+```python
+avail_actions = env.get_avail_actions(state)
+# {"agent_0": jnp.ones(6), "agent_1": jnp.ones(6)}
+```
+
+Observations are flattened 1-D `float32` arrays derived from a local egocentric grid view:
+
+```python
+obs_space = env.observation_space("agent_0")
+# spaces.Box with shape (obs_dim,) where obs_dim = obs_h * obs_w * obs_channels
+```
+
+## Reward shaping
+
+When `do_reward_shaping=True`, `OvercookedV1` adds dense auxiliary rewards to the 20-point delivery bonus. Each coefficient is a two-element list `[reward_agent_0, reward_agent_1]`, allowing asymmetric shaping. Passing a scalar automatically converts it to a symmetric pair.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `PLACEMENT_IN_POT_REW` | `[3, 3]` | Reward for placing an onion in a pot. |
+| `PLATE_PICKUP_REWARD` | `[3, 3]` | Reward for picking up a plate when a non-empty pot exists and no plate is already on a counter. |
+| `SOUP_PICKUP_REWARD` | `[5, 5]` | Reward for picking up a finished soup from a pot. |
+| `ONION_PICKUP_REWARD` | `[0, 0]` | Reward for picking up an onion from an onion pile. |
+| `COUNTER_PICKUP_REWARD` | `[0, 0]` | Reward for picking up an object from a counter. |
+| `COUNTER_DROP_REWARD` | `[0, 0]` | Reward for dropping an object onto an empty counter. |
+| `ONION_HOLDING` | `[0, 0]` | Per-step reward while holding an onion. |
+| `PLATE_HOLDING` | `[0, 0]` | Per-step reward while holding a plate. |
+
+Pass overrides via `reward_shaping_params`. Any key you omit keeps its default value:
+
+```python
+env = make_env('overcooked-v1', {
+    'layout': 'cramped_room',
+    'do_reward_shaping': True,
+    'reward_shaping_params': {
+        'PLACEMENT_IN_POT_REW': [5, 5],
+        'ONION_PICKUP_REWARD': [1, 1],
+    }
+})
+```
+
+The `OvercookedWrapper` exposes the unshaped delivery reward in `info["base_reward"]` on every step, so you can track true task performance even when shaping is active.
+
+## JaxMARL modifications
+
+`OvercookedV1` (defined in `envs/overcooked/overcooked_v1.py`) extends the JaxMARL `Overcooked` class. The changes are:
+
+<AccordionGroup>
+  <Accordion title="Separated random_reset and random_obj_state">
+    The original JaxMARL environment used a single `random_reset` flag to randomize both agent positions and object state (pot fill, agent inventories). JaxAHT splits this into two independent flags:
+
+    - `random_reset=True` — agent starting positions are sampled uniformly from free cells each episode.
+    - `random_obj_state=True` — pot fill status and agent inventories are randomized independently.
+
+    This separation lets you train with randomized agent positions (which improves robustness) without also randomizing object state (which can produce trivially easy or unsolvable episodes).
+  </Accordion>
+  <Accordion title="Component-aware agent initialization">
+    Some kitchen layouts (e.g. `forced_coord`, `asymm_advantages`) have two disconnected free-space components separated by walls. The original JaxMARL code sampled both agent positions from all free cells, which could place both agents in the same component, making task completion impossible.
+
+    `OvercookedV1` precomputes the connected components of each layout and, when `random_reset=True` and the map has at least two components, ensures each agent is placed in a distinct component:
+
+    ```python
+    if self.random_reset and num_components >= 2:
+        # Randomly assign each agent to a different component
+        component_indices = jax.random.choice(
+            subkey, jnp.arange(1, num_components + 1),
+            shape=(num_agents,), replace=False
+        )
+        # Sample a position from each agent's assigned component
+        for i in range(num_agents):
+            component_idx = component_indices[i]
+            component_mask = (free_space_map.reshape(-1) == component_idx).astype(jnp.float32)
+            agent_idx = agent_idx.at[i].set(
+                jax.random.choice(subkey, all_pos, p=component_mask)
+            )
+    ```
+
+    When the map has only one component (e.g. `cramped_room`), agent positions are sampled freely from all non-wall cells.
+  </Accordion>
+  <Accordion title="Expanded reward shaping parameters">
+    The original JaxMARL Overcooked only supported three shaping signals (pot placement, plate pickup, soup pickup). `OvercookedV1` adds signals for onion pickup from piles, picking up objects from counters, and dropping objects onto counters — giving you finer control over the reward signal used to train dense-reward teammates.
+  </Accordion>
+</AccordionGroup>
+
+## Running the test script
+
+Verify the Overcooked environment and heuristic agents work correctly by running:
+
+```bash
+python tests/test_overcooked_agents.py
+```

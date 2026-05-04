@@ -1,0 +1,168 @@
+---
+title: "MLPActorCriticPolicy: stateless feed-forward agent"
+description: "Reference for MLPActorCriticPolicy and its variants: stateless feed-forward policies that map observations to actions without recurrent hidden state."
+---
+
+`MLPActorCriticPolicy` is the simplest agent type in JaxAHT. It uses a two-layer feed-forward network for both the actor and critic, processes each observation independently, and returns `None` for the hidden state on every call. Choose an MLP policy when the task does not require memory of past observations and you want the fastest possible inference and training step.
+
+---
+
+## When to use MLP vs RNN
+
+Use `MLPActorCriticPolicy` when the environment provides enough information in a single observation for a policy to act optimally (a Markov observation). Use `RNNActorCriticPolicy` when the optimal action depends on a sequence of past observations — for example, when teammates' behavior must be inferred over time.
+
+---
+
+## `MLPActorCriticPolicy`
+
+```python
+class MLPActorCriticPolicy(AgentPolicy)
+```
+
+Policy wrapper that builds an `ActorCritic` Flax module and exposes the standard `AgentPolicy` interface. Both actor and critic share the same hidden dimension and activation function but are separate parameter trees.
+
+### Constructor
+
+```python
+MLPActorCriticPolicy(action_dim, obs_dim, activation="tanh", fc_hidden_dim=64)
+```
+
+<ParamField path="action_dim" type="int" required>
+  Number of discrete actions available to the agent. Determines the output size of the actor head.
+</ParamField>
+
+<ParamField path="obs_dim" type="int" required>
+  Dimensionality of the flat observation vector. Used to construct dummy inputs during parameter initialization.
+</ParamField>
+
+<ParamField path="activation" type="str" default='"tanh"'>
+  Activation function applied after each hidden layer. Accepts `"tanh"` or `"relu"`. Defaults to `"tanh"`.
+</ParamField>
+
+<ParamField path="fc_hidden_dim" type="int" default="64">
+  Number of units in each hidden layer of both the actor and critic networks. Defaults to `64`.
+</ParamField>
+
+### Methods
+
+#### `get_action`
+
+```python
+@partial(jax.jit, static_argnums=(0,))
+def get_action(
+    self, params, obs, done, avail_actions, hstate, rng,
+    aux_obs=None, env_state=None, test_mode=False
+) -> Tuple[int, None]
+```
+
+Runs a forward pass through the actor and samples (or greedily selects) an action. Unavailable actions are masked by subtracting `1e10` from their logits before sampling.
+
+Returns `(action, None)` — the hidden state is always `None` because the MLP is stateless.
+
+#### `get_action_value_policy`
+
+```python
+@partial(jax.jit, static_argnums=(0,))
+def get_action_value_policy(
+    self, params, obs, done, avail_actions, hstate, rng,
+    aux_obs=None, env_state=None
+) -> Tuple[int, chex.Array, distrax.Distribution, None]
+```
+
+Runs a full forward pass and returns the action, scalar value estimate, `distrax.Categorical` policy distribution, and `None` for the hidden state. Used by PPO and other training algorithms that need log-probabilities and entropy.
+
+#### `init_params`
+
+```python
+def init_params(self, rng) -> dict
+```
+
+Initializes parameters by calling `self.network.init` with a zero observation and an all-ones available-actions mask.
+
+---
+
+## Network architecture
+
+The underlying `ActorCritic` Flax module (`agents/mlp_actor_critic.py`) applies two dense layers with orthogonal initialization, followed by an activation, to produce both the actor logits and the critic value:
+
+```
+obs ──► Dense(fc_hidden_dim) ──► activation ──► Dense(fc_hidden_dim) ──► activation ──► Dense(action_dim)
+                                                                                           ──► mask unavail ──► Categorical(logits)
+obs ──► Dense(fc_hidden_dim) ──► activation ──► Dense(fc_hidden_dim) ──► activation ──► Dense(1) ──► squeeze ──► value
+```
+
+The action mask is applied as `logits - (1 - avail_actions) * 1e10`, which forces unavailable actions to near-zero probability before sampling.
+
+---
+
+## Instantiation example
+
+```python
+import jax
+from agents.mlp_actor_critic_agent import MLPActorCriticPolicy
+
+rng = jax.random.PRNGKey(0)
+
+policy = MLPActorCriticPolicy(
+    action_dim=6,
+    obs_dim=96,
+    activation="tanh",
+    fc_hidden_dim=64,
+)
+
+params = policy.init_params(rng)
+
+# During rollout — obs shape: (seq_len=1, batch_size=1, obs_dim)
+obs = jax.numpy.zeros((1, 1, 96))
+done = jax.numpy.zeros((1, 1), dtype=bool)
+avail_actions = jax.numpy.ones((6,))
+hstate = None  # MLP policies have no hidden state
+
+rng, act_rng = jax.random.split(rng)
+action, new_hstate = policy.get_action(
+    params, obs, done, avail_actions, hstate, act_rng
+)
+# new_hstate is None
+```
+
+---
+
+## Variant policies
+
+Three additional policy wrappers build on the same feed-forward backbone for specialised training algorithms.
+
+### `ActorWithDoubleCriticPolicy`
+
+```python
+ActorWithDoubleCriticPolicy(action_dim, obs_dim, activation="tanh", fc_hidden_dim=64)
+```
+
+Uses `ActorWithDoubleCritic`, which adds a second independent critic head to the same actor. `get_action_value_policy` returns a tuple `(val1, val2)` instead of a scalar, where `val1` is the ego-agent value and `val2` is the best-response value. Used by algorithms that need separate value estimates for different objective components.
+
+### `PseudoActorWithDoubleCriticPolicy`
+
+Wraps `ActorWithDoubleCriticPolicy` but discards `val2` from `get_action_value_policy`, returning only `val1`. This lets a double-critic checkpoint be used anywhere a single-critic policy is expected without changing the checkpoint or training code.
+
+### `ActorWithConditionalCriticPolicy`
+
+```python
+ActorWithConditionalCriticPolicy(action_dim, obs_dim, pop_size, activation="tanh", fc_hidden_dim=64)
+```
+
+<ParamField path="pop_size" type="int" required>
+  The number of agents in the population that the conditional critic was trained with. Determines the size of the one-hot teammate-identity vector concatenated with the observation before the critic.
+</ParamField>
+
+The actor receives only `obs`; the critic receives `[obs, teammate_id]`. During `get_action` a dummy all-zero identity vector is used so the actor is not conditioned on teammate identity. Pass the actual one-hot vector via `aux_obs` in `get_action_value_policy`.
+
+<Note>
+`PseudoActorWithConditionalCriticPolicy` provides the same single-critic shim for `ActorWithConditionalCriticPolicy` as `PseudoActorWithDoubleCriticPolicy` does for the double-critic variant.
+</Note>
+
+---
+
+## Related pages
+
+- [AgentPolicy interface](/api/agent-interface) — abstract base class all policies implement
+- [RNN actor-critic](/api/agents/rnn-actor-critic) — recurrent policy for memory-dependent tasks
+- [Common utilities](/api/utilities/common) — `run_episodes` and checkpoint helpers

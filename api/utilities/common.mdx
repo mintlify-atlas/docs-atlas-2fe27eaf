@@ -1,0 +1,426 @@
+---
+title: "Shared utilities: episodes, checkpoints, and stats"
+description: "Reference for JaxAHT's common module: run_episodes, save/load checkpoints with Orbax, initialize agents from config, and JAX pytree helpers."
+---
+
+The `common/` directory contains helper modules that are imported across training, evaluation, and analysis scripts. This page documents the public API of each module with signatures taken directly from the source.
+
+---
+
+## `run_episodes` — `common/run_episodes.py`
+
+Two functions cover single-episode and batched evaluation. Both functions pass `aux_obs=(act_onehot, joint_act_onehot, reward)` to agent 0 (the ego agent) to support LIAM and MeLIBA, but do not pass `aux_obs` to agent 1 (the partner).
+
+### `run_single_episode`
+
+```python
+def run_single_episode(
+    rng,
+    env,
+    agent_0_param,
+    agent_0_policy,
+    agent_1_param,
+    agent_1_policy,
+    max_episode_steps,
+    agent_0_test_mode=False,
+    agent_1_test_mode=False,
+)
+```
+
+Runs one episode by resetting the environment and stepping both agents until `done["__all__"]` is `True` or `max_episode_steps` steps have elapsed. Uses `jax.lax.scan` internally so the entire episode unrolls as a single JIT-compiled computation.
+
+<ParamField path="rng" type="jax.random.PRNGKey" required>
+  A JAX random key. Split internally to produce per-step keys for each agent and the environment.
+</ParamField>
+
+<ParamField path="env" type="object" required>
+  A JaxMARL-compatible environment with `reset`, `step`, and `get_avail_actions` methods.
+</ParamField>
+
+<ParamField path="agent_0_param" type="dict" required>
+  Parameter pytree for agent 0 (typically the ego agent), as returned by `init_params` or loaded from a checkpoint.
+</ParamField>
+
+<ParamField path="agent_0_policy" type="AgentPolicy" required>
+  The `AgentPolicy` instance for agent 0.
+</ParamField>
+
+<ParamField path="agent_1_param" type="dict" required>
+  Parameter pytree for agent 1 (the partner).
+</ParamField>
+
+<ParamField path="agent_1_policy" type="AgentPolicy" required>
+  The `AgentPolicy` instance for agent 1.
+</ParamField>
+
+<ParamField path="max_episode_steps" type="int" required>
+  Maximum number of steps to run. Should match the `ROLLOUT_LENGTH` from the task config.
+</ParamField>
+
+<ParamField path="agent_0_test_mode" type="bool" default="False">
+  When `True`, agent 0 uses its policy's mode (greedy/deterministic) instead of sampling.
+</ParamField>
+
+<ParamField path="agent_1_test_mode" type="bool" default="False">
+  When `True`, agent 1 uses its policy's mode.
+</ParamField>
+
+<ResponseField name="info" type="dict">
+  The final `info` dictionary returned by `env.step`. When the environment is wrapped in `LogWrapper`, this includes cumulative episode return and episode length.
+</ResponseField>
+
+### `run_episodes`
+
+```python
+def run_episodes(
+    rng,
+    env,
+    agent_0_param,
+    agent_0_policy,
+    agent_1_param,
+    agent_1_policy,
+    max_episode_steps,
+    num_eps,
+    agent_0_test_mode=False,
+    agent_1_test_mode=False,
+)
+```
+
+Runs `num_eps` episodes in parallel using `jax.vmap` over independent random keys. All episodes are JIT-compiled as a single vectorized computation.
+
+<ParamField path="num_eps" type="int" required>
+  Number of episodes to run in parallel.
+</ParamField>
+
+All other parameters are identical to `run_single_episode`.
+
+<ResponseField name="all_outs" type="dict">
+  A batched version of the `info` dictionary, where each leaf has shape `(num_eps, ...)`.
+</ResponseField>
+
+### Example
+
+```python
+import jax
+from common.run_episodes import run_episodes
+
+rng = jax.random.PRNGKey(42)
+
+results = run_episodes(
+    rng=rng,
+    env=env,
+    agent_0_param=ego_params,
+    agent_0_policy=ego_policy,
+    agent_1_param=partner_params,
+    agent_1_policy=partner_policy,
+    max_episode_steps=400,
+    num_eps=20,
+    agent_0_test_mode=True,
+)
+
+# results["returned_episode_returns"] has shape (20,) when using LogWrapper
+mean_return = results["returned_episode_returns"].mean()
+```
+
+---
+
+## `save_load_utils` — `common/save_load_utils.py`
+
+Checkpoint I/O using [Orbax](https://orbax.readthedocs.io/). Relative paths are resolved from the repository root automatically.
+
+### `save_train_run`
+
+```python
+def save_train_run(out, savedir, savename) -> str
+```
+
+Saves a pytree to an Orbax checkpoint directory.
+
+<ParamField path="out" type="dict" required>
+  The pytree to save. Typically the full training output dictionary (including `checkpoints`, `metrics`, etc.).
+</ParamField>
+
+<ParamField path="savedir" type="str" required>
+  Directory in which to create the checkpoint. Relative paths are resolved from the repository root.
+</ParamField>
+
+<ParamField path="savename" type="str" required>
+  Name of the checkpoint subdirectory created inside `savedir`.
+</ParamField>
+
+<ResponseField name="savepath" type="str">
+  The absolute path to the saved checkpoint directory.
+</ResponseField>
+
+### `load_train_run`
+
+```python
+def load_train_run(path) -> dict
+```
+
+Loads a full training checkpoint and returns the pytree. Automatically falls back to CPU restore if GPU sharding metadata mismatches (controlled by the `JAX_AHT_FORCE_CPU_RESTORE=1` environment variable).
+
+<ParamField path="path" type="str" required>
+  Path to the checkpoint directory. Relative paths are resolved from the repository root.
+</ParamField>
+
+### `load_checkpoints`
+
+```python
+def load_checkpoints(path, ckpt_key="checkpoints", custom_loader_cfg=None) -> dict
+```
+
+Convenience wrapper around `load_train_run` that extracts a single top-level key from the checkpoint.
+
+<ParamField path="path" type="str" required>
+  Path to the checkpoint directory.
+</ParamField>
+
+<ParamField path="ckpt_key" type="str" default='"checkpoints"'>
+  Top-level key to extract from the restored pytree. Common values: `"checkpoints"`, `"final_params"`, `"final_buffer"`.
+</ParamField>
+
+<ParamField path="custom_loader_cfg" type="dict">
+  Optional dictionary to enable special loading modes:
+
+  <Expandable title="custom_loader_cfg options">
+    <ParamField path="name" type="str">
+      Loader name. Supported values:
+      - `"open_ended"` — loads ego or partner branch of an open-ended training checkpoint. Requires `"type"` key (`"ego"` or `"partner"`).
+      - `"partial_load"` — loads only the specified `ckpt_key` from the checkpoint, avoiding OOM from loading the full pytree.
+      - `"fcp"` — reshapes FCP checkpoints from `(NUM_SEEDS, PARTNER_POP_SIZE, NUM_CHECKPOINTS, ...)` to `(NUM_SEEDS, PARTNER_POP_SIZE * NUM_CHECKPOINTS, ...)`.
+    </ParamField>
+    <ParamField path="type" type="str">
+      Required when `name` is `"open_ended"`. Set to `"ego"` or `"partner"`.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+### Example
+
+```python
+from common.save_load_utils import save_train_run, load_checkpoints
+
+# Save after training
+save_train_run(train_out, savedir="results/ippo", savename="run_0")
+
+# Load checkpoints for evaluation
+checkpoints = load_checkpoints(
+    path="results/ippo/run_0",
+    ckpt_key="checkpoints",
+)
+# checkpoints has shape (NUM_SEEDS, NUM_CHECKPOINTS, ...)
+```
+
+---
+
+## `agent_loader_from_config` — `common/agent_loader_from_config.py`
+
+Loads and initializes agents from configuration dictionaries, dispatching to the correct agent type based on `actor_type`.
+
+### `initialize_rl_agent_from_config`
+
+```python
+def initialize_rl_agent_from_config(
+    agent_config,
+    agent_name,
+    env,
+    rng,
+) -> Tuple[AgentPolicy, dict, dict, list]
+```
+
+Loads a learned agent's checkpoint and creates the policy object. The `agent_config` must contain at least `"path"`, `"actor_type"`, and `"idx_list"`.
+
+<ParamField path="agent_config" type="dict" required>
+  Configuration dictionary for the agent. Required keys:
+
+  <Expandable title="agent_config keys">
+    <ParamField path="path" type="str">
+      Path to the Orbax checkpoint directory.
+    </ParamField>
+    <ParamField path="actor_type" type="str">
+      Agent architecture. One of `"mlp"`, `"rnn"`, `"s5"`, `"actor_with_double_critic"`, `"actor_with_conditional_critic"`.
+    </ParamField>
+    <ParamField path="idx_list" type="list | null">
+      Indices to slice from the checkpoint. Pass `null` to load all checkpoints. Supports 1-D indices `[0, 1]` or 2-D indices `[[0, -1], [1, -1]]`.
+    </ParamField>
+    <ParamField path="ckpt_key" type="str">
+      Top-level key to load from the checkpoint. Defaults to `"checkpoints"`.
+    </ParamField>
+    <ParamField path="custom_loader" type="dict">
+      Optional custom loader config forwarded to `load_checkpoints`.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField path="agent_name" type="str" required>
+  Human-readable name used in log messages.
+</ParamField>
+
+<ParamField path="env" type="object" required>
+  Environment instance used to infer action and observation dimensions.
+</ParamField>
+
+<ParamField path="rng" type="jax.random.PRNGKey" required>
+  Random key for parameter initialization.
+</ParamField>
+
+<ResponseField name="policy" type="AgentPolicy">
+  The initialized policy object.
+</ResponseField>
+
+<ResponseField name="agent_params" type="dict">
+  Parameters sliced from the checkpoint according to `idx_list`.
+</ResponseField>
+
+<ResponseField name="init_params" type="dict">
+  Freshly initialized parameters with the same structure as `agent_params`. Useful for verifying pytree compatibility.
+</ResponseField>
+
+<ResponseField name="idx_labels" type="list[str]">
+  Human-readable string labels for the loaded checkpoint indices (e.g., `["0, -1", "1, -1"]`).
+</ResponseField>
+
+### `initialize_heuristic_agent_from_config`
+
+```python
+def initialize_heuristic_agent_from_config(
+    agent_config,
+    agent_name,
+    task_name,
+    env_kwargs=None,
+) -> AgentPolicy
+```
+
+Creates a heuristic agent wrapper without loading any checkpoint. `agent_config` must contain `"actor_type"`. Additional keys (e.g., `heuristic`, `ordering_strategy`) are forwarded to the wrapper constructor.
+
+<ParamField path="task_name" type="str" required>
+  Task identifier string. Must contain `"lbf"`, `"overcooked-v1"`, or `"hanabi"` to select the correct set of wrappers.
+</ParamField>
+
+---
+
+## `tree_utils` — `common/tree_utils.py`
+
+Utilities for working with JAX pytrees (nested dicts, tuples, or lists of arrays).
+
+### `tree_stack`
+
+```python
+def tree_stack(trees) -> pytree
+```
+
+Stacks a list of identically structured pytrees along a new leading axis.
+
+<ParamField path="trees" type="list" required>
+  A list of pytrees that all have the same structure and leaf shapes.
+</ParamField>
+
+<ResponseField name="stacked" type="pytree">
+  A single pytree where each leaf has shape `(len(trees), *original_leaf_shape)`.
+</ResponseField>
+
+### `tree_unstack`
+
+```python
+def tree_unstack(tree) -> list
+```
+
+The inverse of `tree_stack`. Splits a pytree along its leading axis into a list of pytrees.
+
+<ResponseField name="trees" type="list">
+  A list of pytrees, each containing leaves with the leading dimension removed.
+</ResponseField>
+
+### Example
+
+```python
+from common.tree_utils import tree_stack, tree_unstack
+
+# Stack three parameter dicts into a single batched pytree
+stacked = tree_stack([params_0, params_1, params_2])
+# Each leaf in stacked has shape (3, ...)
+
+# Recover the original list
+recovered = tree_unstack(stacked)
+```
+
+---
+
+## `stat_utils` — `common/stat_utils.py`
+
+Statistical aggregation with bootstrapped confidence intervals, built on the [rliable](https://github.com/google-research/rliable) library.
+
+### `compute_aggregate_stat_and_ci`
+
+```python
+def compute_aggregate_stat_and_ci(
+    data: np.ndarray,
+    agg_stat_name: str,
+    return_interval_est: bool,
+)
+```
+
+Computes a single aggregate statistic and optionally a 95% bootstrapped confidence interval over all tasks and runs.
+
+<ParamField path="data" type="np.ndarray" required>
+  A 2-D array of shape `(num_runs, num_tasks)` containing episode returns or other scalar metrics.
+</ParamField>
+
+<ParamField path="agg_stat_name" type="str" required>
+  The aggregation method. Accepts `"iqm"` (interquartile mean) or `"mean"`.
+</ParamField>
+
+<ParamField path="return_interval_est" type="bool" required>
+  When `True`, also returns a bootstrapped 95% CI computed over 25,000 resamples.
+</ParamField>
+
+<ResponseField name="point_est" type="float">
+  The scalar aggregate statistic over all data.
+</ResponseField>
+
+<ResponseField name="interval_est" type="np.ndarray">
+  The `[lower, upper]` confidence interval bounds. Only returned when `return_interval_est=True`.
+</ResponseField>
+
+### `compute_aggregate_stat_and_ci_per_task`
+
+```python
+def compute_aggregate_stat_and_ci_per_task(
+    data: np.ndarray,
+    agg_stat_name: str,
+    return_interval_est: bool,
+)
+```
+
+The same as `compute_aggregate_stat_and_ci` but computes a separate point estimate and CI for each task column independently.
+
+<ResponseField name="point_ests" type="np.ndarray">
+  Array of shape `(num_tasks,)` with the aggregate statistic for each task.
+</ResponseField>
+
+<ResponseField name="interval_ests" type="np.ndarray">
+  Array of shape `(num_tasks, 2)` with `[lower, upper]` CI bounds per task. Only returned when `return_interval_est=True`.
+</ResponseField>
+
+### Example
+
+```python
+import numpy as np
+from common.stat_utils import compute_aggregate_stat_and_ci
+
+# data[i, j] is the return of run i on task j
+data = np.random.rand(5, 3)  # 5 runs, 3 tasks
+
+point, ci = compute_aggregate_stat_and_ci(data, "iqm", return_interval_est=True)
+print(f"IQM: {point:.3f}  95% CI: [{ci[0]:.3f}, {ci[1]:.3f}]")
+```
+
+---
+
+## Related pages
+
+- [AgentPolicy interface](/api/agent-interface) — the interface all agents implement
+- [MLP actor-critic](/api/agents/mlp-actor-critic) — feed-forward agent
+- [RNN actor-critic](/api/agents/rnn-actor-critic) — recurrent agent
+- [Hydra configuration](/api/utilities/configuration) — config system and YAML structure

@@ -1,0 +1,296 @@
+---
+title: "AgentPolicy: abstract base class for all JaxAHT agents"
+description: "Reference for AgentPolicy — the common interface every agent in JaxAHT must implement to interact with environments and training algorithms."
+---
+
+`AgentPolicy` is the abstract base class that every agent in JaxAHT extends. It defines the five methods that training algorithms and evaluation code rely on: computing actions, computing actions with values and policy distributions, initializing hidden state, and initializing network parameters. All compute methods are JIT-compiled with `jax.jit`, so you must implement them in a way that is compatible with JAX's functional style.
+
+<Note>
+All abstract methods are decorated with `@partial(jax.jit, static_argnums=(0,))`, which treats `self` as a static argument. This means the policy instance is traced once and reused — avoid storing mutable Python state on `self` that changes between calls.
+</Note>
+
+## Class definition
+
+```python
+class AgentPolicy(abc.ABC):
+    def __init__(self, action_dim, obs_dim): ...
+    def get_action(self, params, obs, done, avail_actions, hstate, rng,
+                   aux_obs=None, env_state=None, test_mode=False): ...
+    def get_action_value_policy(self, params, obs, done, avail_actions, hstate, rng,
+                                aux_obs=None, env_state=None): ...
+    def init_hstate(self, batch_size, aux_info=None): ...
+    def init_params(self, rng): ...
+```
+
+---
+
+## `__init__`
+
+```python
+def __init__(self, action_dim, obs_dim)
+```
+
+Stores the action and observation dimensionalities on the instance. Subclass constructors must call `super().__init__(action_dim, obs_dim)` and may then build their network objects.
+
+<ParamField path="action_dim" type="int" required>
+  The number of discrete actions available to the agent.
+</ParamField>
+
+<ParamField path="obs_dim" type="int" required>
+  The dimensionality of the flat observation vector the agent receives.
+</ParamField>
+
+---
+
+## `get_action`
+
+```python
+@partial(jax.jit, static_argnums=(0,))
+def get_action(
+    self,
+    params,
+    obs,
+    done,
+    avail_actions,
+    hstate,
+    rng,
+    aux_obs=None,
+    env_state=None,
+    test_mode=False,
+) -> Tuple[int, chex.Array]
+```
+
+Samples (or selects deterministically in test mode) an action given the current observation and auxiliary inputs. Use this method during rollout collection. It does **not** compute values or policy distributions.
+
+### Parameters
+
+<ParamField path="params" type="dict" required>
+  The pytree of network parameters returned by `init_params`.
+</ParamField>
+
+<ParamField path="obs" type="chex.Array" required>
+  The observation array. Shape depends on the policy type: `(obs_dim,)` for MLP policies; `(seq_len, batch_size, obs_dim)` for RNN policies.
+</ParamField>
+
+<ParamField path="done" type="chex.Array" required>
+  A boolean array indicating which environments finished their episode on the previous step. RNN policies use this to reset their hidden state at episode boundaries. Shape: `(batch_size,)` for MLP; `(seq_len, batch_size)` for RNN.
+</ParamField>
+
+<ParamField path="avail_actions" type="chex.Array" required>
+  A binary mask of shape `(..., action_dim)` where `1` marks legal actions. Illegal actions are masked out before sampling.
+</ParamField>
+
+<ParamField path="hstate" type="chex.Array" required>
+  The recurrent hidden state. Pass `None` for stateless (MLP) policies. For RNN policies the expected shape is `(1, batch_size, gru_hidden_dim)`.
+</ParamField>
+
+<ParamField path="rng" type="jax.random.PRNGKey" required>
+  A JAX random key used to sample the action.
+</ParamField>
+
+<ParamField path="aux_obs" type="chex.Array">
+  An optional auxiliary observation vector appended to the main observation inside the network forward pass. Defaults to `None`.
+</ParamField>
+
+<ParamField path="env_state" type="chex.Array">
+  The full environment state, available for policies that need privileged information. Defaults to `None`.
+</ParamField>
+
+<ParamField path="test_mode" type="bool" default="False">
+  When `True`, the policy returns the mode of the action distribution (greedy/deterministic). When `False`, it samples stochastically.
+</ParamField>
+
+### Returns
+
+<ResponseField name="action" type="int">
+  The selected action index.
+</ResponseField>
+
+<ResponseField name="new_hstate" type="chex.Array">
+  The updated hidden state after processing the current observation. Returns `None` for stateless policies.
+</ResponseField>
+
+---
+
+## `get_action_value_policy`
+
+```python
+@partial(jax.jit, static_argnums=(0,))
+def get_action_value_policy(
+    self,
+    params,
+    obs,
+    done,
+    avail_actions,
+    hstate,
+    rng,
+    aux_obs=None,
+    env_state=None,
+) -> Tuple[int, chex.Array, chex.Array, chex.Array]
+```
+
+Runs a full forward pass and returns the action, value estimate, policy distribution, and updated hidden state. Training algorithms call this method during the learning step, where value targets and policy logits are both required.
+
+### Parameters
+
+<ParamField path="params" type="dict" required>
+  The pytree of network parameters.
+</ParamField>
+
+<ParamField path="obs" type="chex.Array" required>
+  The observation array. Same shape convention as `get_action`.
+</ParamField>
+
+<ParamField path="done" type="chex.Array" required>
+  Done flags. Same shape convention as `get_action`.
+</ParamField>
+
+<ParamField path="avail_actions" type="chex.Array" required>
+  Binary action mask of shape `(..., action_dim)`.
+</ParamField>
+
+<ParamField path="hstate" type="chex.Array" required>
+  Recurrent hidden state, or `None` for stateless policies.
+</ParamField>
+
+<ParamField path="rng" type="jax.random.PRNGKey" required>
+  A JAX random key used to sample the action.
+</ParamField>
+
+<ParamField path="aux_obs" type="chex.Array">
+  Optional auxiliary observation. Some policies (e.g., `ActorWithConditionalCriticPolicy`) use this to pass agent identity one-hot vectors to the critic. Defaults to `None`.
+</ParamField>
+
+<ParamField path="env_state" type="chex.Array">
+  The full environment state for privileged-access policies. Defaults to `None`.
+</ParamField>
+
+### Returns
+
+<ResponseField name="action" type="int">
+  The sampled action index.
+</ResponseField>
+
+<ResponseField name="value" type="chex.Array">
+  The critic's value estimate for the current observation. Some policies (e.g., `ActorWithDoubleCriticPolicy`) return a tuple of values instead of a scalar.
+</ResponseField>
+
+<ResponseField name="policy" type="chex.Array">
+  The action distribution object (a `distrax` or `flax` distribution) from which `action` was sampled. Training algorithms use this to compute log-probabilities and entropy.
+</ResponseField>
+
+<ResponseField name="new_hstate" type="chex.Array">
+  The updated hidden state, or `None` for stateless policies.
+</ResponseField>
+
+---
+
+## `init_hstate`
+
+```python
+def init_hstate(self, batch_size, aux_info: dict = None) -> chex.Array
+```
+
+Creates a zeroed-out initial hidden state sized for `batch_size` parallel environments. The base class returns `None` (suitable for stateless MLP policies). Override this in RNN-based policies.
+
+<ParamField path="batch_size" type="int" required>
+  The number of parallel environments (or agents) to initialize hidden state for.
+</ParamField>
+
+<ParamField path="aux_info" type="dict">
+  Optional dictionary of auxiliary information needed to construct the initial state — for example, the agent ID at the start of an episode. Defaults to `None`.
+</ParamField>
+
+### Returns
+
+<ResponseField name="hstate" type="chex.Array">
+  The initial hidden state array, or `None` for stateless policies. For `RNNActorCriticPolicy` the shape is `(1, batch_size, gru_hidden_dim)`.
+</ResponseField>
+
+---
+
+## `init_params`
+
+```python
+def init_params(self, rng) -> Dict
+```
+
+Initializes the network parameters by running a dummy forward pass. The base class returns `None`. Subclasses must override this to call `self.network.init(rng, dummy_inputs)` with appropriately shaped dummy inputs.
+
+<ParamField path="rng" type="jax.random.PRNGKey" required>
+  A JAX random key used to initialize the network weights.
+</ParamField>
+
+### Returns
+
+<ResponseField name="params" type="dict">
+  A pytree of initialized network parameters suitable for passing to `get_action` and `get_action_value_policy`.
+</ResponseField>
+
+---
+
+## Done signal handling
+
+Every policy receives a `done` flag alongside each observation. You must handle this signal correctly, especially in RNN-based policies:
+
+- **MLP policies** typically ignore `done` because they have no hidden state to reset.
+- **RNN policies** must gate the hidden state on `done` — when `done` is `True` for an environment, the GRU carry for that environment must be zeroed before the next step. `RNNActorCriticPolicy` does this automatically via `ScannedRNN`.
+
+<Warning>
+Failing to reset hidden state on episode boundaries causes value and policy estimates to "bleed" across episodes, which silently corrupts training.
+</Warning>
+
+---
+
+## Implementing a custom policy
+
+Subclass `AgentPolicy` and override at minimum `get_action`, `get_action_value_policy`, and `init_params`. Override `init_hstate` only if your policy is recurrent.
+
+```python
+import jax
+import jax.numpy as jnp
+from functools import partial
+from agents.agent_interface import AgentPolicy
+
+
+class MyMLPPolicy(AgentPolicy):
+    """A simple MLP policy that wraps a Flax network."""
+
+    def __init__(self, action_dim, obs_dim):
+        super().__init__(action_dim, obs_dim)
+        # Build your Flax network here
+        self.network = MyNetwork(action_dim)
+
+    @partial(jax.jit, static_argnums=(0,))
+    def get_action(self, params, obs, done, avail_actions, hstate, rng,
+                   aux_obs=None, env_state=None, test_mode=False):
+        pi, _ = self.network.apply(params, (obs, avail_actions))
+        action = jax.lax.cond(
+            test_mode,
+            lambda: pi.mode(),
+            lambda: pi.sample(seed=rng),
+        )
+        return action, None  # no hidden state for MLP
+
+    @partial(jax.jit, static_argnums=(0,))
+    def get_action_value_policy(self, params, obs, done, avail_actions, hstate, rng,
+                                aux_obs=None, env_state=None):
+        pi, val = self.network.apply(params, (obs, avail_actions))
+        action = pi.sample(seed=rng)
+        return action, val, pi, None  # no hidden state for MLP
+
+    def init_params(self, rng):
+        dummy_obs = jnp.zeros((self.obs_dim,))
+        dummy_avail = jnp.ones((self.action_dim,))
+        return self.network.init(rng, (dummy_obs, dummy_avail))
+```
+
+<Tip>
+Pass `test_mode=True` when evaluating a trained agent to get deterministic greedy actions instead of stochastic samples.
+</Tip>
+
+## Related pages
+
+- [AgentPopulation](/api/population-interface) — wraps an `AgentPolicy` to manage a population of agents
+- [MLP Actor-Critic](/api/agents/mlp-actor-critic) — concrete MLP implementation of `AgentPolicy`
+- [RNN Actor-Critic](/api/agents/rnn-actor-critic) — concrete RNN implementation of `AgentPolicy`

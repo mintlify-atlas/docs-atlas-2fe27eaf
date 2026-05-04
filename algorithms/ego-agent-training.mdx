@@ -1,0 +1,236 @@
+---
+title: "Ego agent training in JaxAHT: PPO, LIAM, and MeLIBA"
+description: "Train an ego agent against a fixed partner population using PPO, LIAM, or MeLIBA, each with a different approach to modeling and adapting to teammates."
+---
+
+Ego agent training is the core AHT workflow: you provide a fixed population of partner agents and train a single ego agent to cooperate effectively with any member of that population. At each environment reset the ego is paired with a partner drawn uniformly from the pool, so the ego must generalize across all partner behaviors rather than overfitting to any one partner.
+
+All three ego training algorithms share the same entry point at `ego_agent_training/run.py` and differ only in how the ego agent models and adapts to its current partner.
+
+<Note>
+Ego agent training requires a pre-trained partner population. You must specify a partner config before running any of these algorithms. See the [partner config requirement](#partner-config-requirement) section below.
+</Note>
+
+## Algorithms
+
+<Tabs>
+  <Tab title="PPO Ego">
+    PPO Ego trains a recurrent S5-based actor-critic ego agent using clipped Proximal Policy Optimization. The ego observes only its own local observations and learns to be robust across the training partner pool without explicit teammate modeling. It is the default ego training subroutine used by all two-stage teammate generation methods.
+
+    **Run commands**
+
+    ```bash
+    # LBF 7x7 (no levels)
+    python ego_agent_training/run.py \
+        algorithm=ppo_ego/lbf/lbf_7x7_nolevels \
+        task=lbf/lbf_7x7_nolevels \
+        label=my_ppo_ego
+
+    # Overcooked cramped room
+    python ego_agent_training/run.py \
+        algorithm=ppo_ego/overcooked-v1/cramped_room \
+        task=overcooked-v1/cramped_room \
+        label=my_ppo_ego
+    ```
+
+    **Key hyperparameters** (`ego_agent_training/configs/algorithm/ppo_ego/_base_.yaml`)
+
+    ```yaml
+    ALG: ppo_ego
+    EGO_ACTOR_TYPE: s5
+    TOTAL_TIMESTEPS: 1e7
+    NUM_ENVS: 8
+    LR: 1.0e-4
+    UPDATE_EPOCHS: 15
+    NUM_MINIBATCHES: 4
+    GAMMA: 0.99
+    GAE_LAMBDA: 0.95
+    CLIP_EPS: 0.05
+    ENT_COEF: 0.01
+    VF_COEF: 0.5
+    MAX_GRAD_NORM: 1.0
+    ANNEAL_LR: true
+    NUM_CHECKPOINTS: 5
+    ```
+
+    Task-specific overrides for LBF 7x7 (`configs/algorithm/ppo_ego/lbf/lbf_7x7_nolevels.yaml`):
+
+    ```yaml
+    TOTAL_TIMESTEPS: 6e7
+    LR: 5e-5
+    ENT_COEF: 1e-4
+    CLIP_EPS: 0.1
+    ANNEAL_LR: false
+    UPDATE_EPOCHS: 10
+    S5_D_MODEL: 128
+    S5_SSM_SIZE: 128
+    S5_ACTOR_CRITIC_HIDDEN_DIM: 1024
+    FC_N_LAYERS: 3
+    ```
+  </Tab>
+  <Tab title="LIAM">
+    LIAM (Learned Influence Aware Models) augments PPO with a teammate-modelling encoder-decoder. The encoder embeds the partner's observation and action history into a latent representation that is concatenated with the ego's own observation before policy inference. A reconstruction loss trains the decoder to predict the partner's observations from this embedding.
+
+    **Paper:** [Papoudakis et al. 2021](https://arxiv.org/abs/2006.09447)
+
+    **Run commands**
+
+    ```bash
+    # LBF 7x7 (no levels)
+    python ego_agent_training/run.py \
+        algorithm=liam_ego/lbf/lbf_7x7_nolevels \
+        task=lbf/lbf_7x7_nolevels \
+        label=my_liam_ego
+
+    # Overcooked cramped room (example)
+    python ego_agent_training/run.py \
+        algorithm=liam_ego/overcooked-v1/cramped_room \
+        task=overcooked-v1/cramped_room \
+        label=my_liam_ego
+    ```
+
+    **Key hyperparameters** (`ego_agent_training/configs/algorithm/liam_ego/_base_.yaml`)
+
+    ```yaml
+    ALG: liam_ego
+    ENCODER_TYPE: lstm
+    EGO_ACTOR_TYPE: mlp
+    TOTAL_TIMESTEPS: 1e7
+    NUM_ENVS: 8
+    LR: 3e-4
+    ENCODER_DECODER_LR: 7e-4
+    UPDATE_EPOCHS: 15
+    NUM_MINIBATCHES: 4
+    GAMMA: 0.99
+    GAE_LAMBDA: 0.95
+    CLIP_EPS: 0.05
+    ENT_COEF: 0.01
+    VF_COEF: 0.5
+    RECON_COEF: 1.0          # weight on reconstruction loss
+    MAX_GRAD_NORM: 0.5
+    ANNEAL_LR: false
+    ENCODER_HIDDEN_DIM: 64
+    ENCODER_OUTPUT_DIM: 20   # embedding dimension
+    DECODER_HIDDEN_DIM: 64
+    ```
+
+    LIAM trains separate optimizers for the policy network and the encoder-decoder pair. The total loss combines the PPO objective with `RECON_COEF * reconstruction_loss`.
+  </Tab>
+  <Tab title="MeLIBA">
+    MeLIBA (Meta-Learning for Ad Hoc Teamwork by Influence-Based Abstractions) extends LIAM with a variational encoder. Instead of a deterministic embedding, the encoder outputs a Gaussian latent distribution and the decoder is trained via an ELBO objective that balances reconstruction quality with the KL divergence from a unit normal prior. The resulting latent captures structured uncertainty about the partner's behavior type.
+
+    **Paper:** [Zintgraf et al. 2022](https://arxiv.org/abs/2101.03864)
+
+    **Run commands**
+
+    ```bash
+    # LBF 7x7 (no levels)
+    python ego_agent_training/run.py \
+        algorithm=meliba_ego/lbf/lbf_7x7_nolevels \
+        task=lbf/lbf_7x7_nolevels \
+        label=my_meliba_ego
+
+    # Overcooked cramped room (example)
+    python ego_agent_training/run.py \
+        algorithm=meliba_ego/overcooked-v1/cramped_room \
+        task=overcooked-v1/cramped_room \
+        label=my_meliba_ego
+    ```
+
+    **Key hyperparameters** (`ego_agent_training/configs/algorithm/meliba_ego/_base_.yaml`)
+
+    ```yaml
+    ALG: meliba_ego
+    EGO_ACTOR_TYPE: mlp
+    TOTAL_TIMESTEPS: 1e7
+    NUM_ENVS: 8
+    LR: 7e-4
+    ENCODER_DECODER_LR: 0.001
+    UPDATE_EPOCHS: 15
+    NUM_MINIBATCHES: 4
+    GAMMA: 0.99
+    GAE_LAMBDA: 0.9
+    CLIP_EPS: 0.1
+    ENT_COEF: 0.2
+    VF_COEF: 0.5
+    MAX_GRAD_NORM: 0.5
+    ANNEAL_LR: false
+    ENCODER_LATENT_DIM: 64   # latent dimension z
+    DECODER_LOSS_COEFF: 1.0  # reconstruction weight
+    DECODER_KL_WEIGHT: 0.05  # KL divergence weight
+    ```
+
+    MeLIBA's ELBO loss is `DECODER_KL_WEIGHT * kl_loss + DECODER_LOSS_COEFF * recon_loss`. The policy's input dimension is derived automatically at runtime as `(ENCODER_LATENT_DIM * 4) + obs_dim`.
+  </Tab>
+</Tabs>
+
+## Partner config requirement
+
+Every ego training run requires you to specify a partner agent config that points to pre-trained checkpoint files. The config is set inside `ego_agent_training/configs/algorithm/<alg>/_base_.yaml` under the `partner_agent` key, or you can override it on the command line.
+
+```yaml
+# ego_agent_training/configs/algorithm/ppo_ego/_base_.yaml
+partner_agent:
+  ippo:                          # arbitrary name for this partner type
+    path: path/to/saved_train_run/  # directory of a saved checkpoint
+    actor_type: mlp              # s5, rnn, or mlp
+    ckpt_key: final_params       # key in the checkpoint pytree
+    idx_list: [0]                # checkpoint indices to load; null = all
+```
+
+To override the path at the command line without editing the YAML:
+
+```bash
+python ego_agent_training/run.py \
+    algorithm=ppo_ego/lbf/lbf_7x7_nolevels \
+    task=lbf/lbf_7x7_nolevels \
+    algorithm.partner_agent.ippo.path=eval_teammates/lbf/ippo/saved_train_run/
+```
+
+<Tip>
+After downloading the evaluation data with `python download_eval_data.py`, you can point `path` at the downloaded checkpoint directories under `eval_teammates/` to train ego agents against the provided evaluation partner sets.
+</Tip>
+
+## Config directory structure
+
+Each ego training algorithm uses the following directory layout inside `ego_agent_training/configs/`:
+
+```
+configs/
+├── base_config_ego.yaml      # master config merged at runtime
+├── hydra/
+│   └── hydra_simple.yaml     # output directory and sweep settings
+├── algorithm/
+│   ├── ppo_ego/
+│   │   ├── _base_.yaml       # default hyperparameters
+│   │   ├── lbf/
+│   │   │   ├── lbf_7x7_nolevels.yaml
+│   │   │   └── lbf_12x12.yaml
+│   │   └── overcooked-v1/
+│   │       ├── cramped_room.yaml
+│   │       └── ...
+│   ├── liam_ego/
+│   │   └── ...
+│   └── meliba_ego/
+│       └── ...
+└── task/
+    ├── lbf/
+    │   └── lbf_7x7_nolevels.yaml
+    └── overcooked-v1/
+        └── cramped_room.yaml
+```
+
+Hydra merges the task config, the algorithm's `_base_.yaml`, and the task-specific algorithm override file in that order, then applies any command-line overrides on top.
+
+## Quick debug runs
+
+To verify the setup end-to-end with a small timestep budget and no logging:
+
+```bash
+python ego_agent_training/run.py \
+    algorithm=ppo_ego/lbf/lbf_7x7_nolevels \
+    task=lbf/lbf_7x7_nolevels \
+    label=debug \
+    logger.mode=disabled \
+    algorithm.TOTAL_TIMESTEPS=1e5
+```

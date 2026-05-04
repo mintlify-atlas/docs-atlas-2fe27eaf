@@ -1,0 +1,176 @@
+---
+title: "Level-Based Foraging (LBF) cooperative grid environment"
+description: "LBF grid variants, level-based food mechanics, action and observation spaces, the DifferentLevelsGenerator, and reward shaping in JaxAHT."
+---
+
+Level-Based Foraging (LBF) is a cooperative grid-world task where two agents must work together to collect food items. Each agent and each food item has an integer level, and an agent (or group of agents) can only collect a food item if the sum of their levels is at least as high as the food item's level. JaxAHT wraps the [Jumanji](https://github.com/instadeepai/jumanji) LBF implementation with a unified interface and adds reward sharing and an optional reward-shaping variant.
+
+## Task description
+
+Agents navigate a discrete grid and collect food by moving adjacent to a food item and taking the `LOAD` action simultaneously. A food item is collected when all agents attempting to load it satisfy the level requirement. The episode ends when all food items are collected or the step limit is reached. Rewards are shared equally across agents when `share_rewards=True` (the default in JaxAHT).
+
+## Variants
+
+JaxAHT defines two standard configurations used across algorithms and evaluation:
+
+| Variant name | `grid_size` | `num_food` | `different_levels` | Notes |
+|---|---|---|---|---|
+| `lbf_7x7_nolevels` | 7 | 3 | `False` | All food requires cooperation; uniform agent/food levels |
+| `lbf_12x12` | 12 | 6 | `True` | Mixed solo and cooperative food; larger, sparser grid |
+
+You can also instantiate any custom combination — see [Configuration parameters](#configuration-parameters) below.
+
+## Creating an LBF environment
+
+Use `make_env()` with the env name `'lbf'` or `'lbf-reward-shaping'`:
+
+```python
+from envs import make_env
+
+# Standard lbf_7x7_nolevels configuration
+env = make_env('lbf', {'grid_size': 7, 'num_food': 3, 'different_levels': False})
+
+# Standard lbf_12x12 configuration
+env = make_env('lbf', {'grid_size': 12, 'num_food': 6, 'different_levels': True})
+
+# Reward-shaping variant
+env = make_env('lbf-reward-shaping', {'grid_size': 7, 'num_food': 3})
+```
+
+To run a basic environment loop:
+
+```python
+import jax
+from envs import make_env
+
+env = make_env('lbf', {'grid_size': 7, 'num_food': 3})
+
+key = jax.random.PRNGKey(0)
+key, reset_key = jax.random.split(key)
+
+obs, state = env.reset(reset_key)
+
+for _ in range(10):
+    key, step_key = jax.random.split(key)
+    avail_actions = env.get_avail_actions(state)
+    # Sample random actions (replace with your policy)
+    actions = {
+        agent: jax.random.randint(step_key, (), 0, env.action_space(agent).n)
+        for agent in env.agents
+    }
+    obs, state, rewards, dones, info = env.step(step_key, state, actions)
+    if dones['__all__']:
+        break
+```
+
+## Configuration parameters
+
+`make_env()` accepts the following keyword arguments for LBF:
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `grid_size` | `int` | `7` | Side length of the square grid. Also sets the field of view (`fov`) to the full grid. |
+| `num_food` | `int` | `3` | Number of food items placed on the grid each episode. |
+| `different_levels` | `bool` | `False` | When `True`, uses `DifferentLevelsGenerator` to create mixed-level food (see below). |
+| `force_coop` | `bool` | `True` | When `True` (default), all food levels are set to the sum of agent levels, requiring cooperation. Only applies when `different_levels=False`. |
+
+These parameters are forwarded to the Jumanji `LbfGenerator` (or `DifferentLevelsGenerator`). Additional Jumanji generator kwargs can also be passed through `env_kwargs`.
+
+## DifferentLevelsGenerator vs. standard generator
+
+When `different_levels=False`, `make_env()` uses the Jumanji `RandomGenerator` with `force_coop=True`. Every food item gets a level equal to the combined level of all agents, so every item requires both agents to collect.
+
+When `different_levels=True`, `make_env()` uses the custom `DifferentLevelsGenerator`:
+
+```python
+class DifferentLevelsGenerator(RandomGenerator):
+    """Wraps RandomGenerator and overrides food levels to guarantee variety."""
+
+    def __call__(self, key: chex.PRNGKey) -> State:
+        key, shuffle_key = jax.random.split(key)
+        state = super().__call__(key)
+
+        agent_levels = state.agents.level          # (num_agents,)
+        combined = jnp.sum(agent_levels)
+
+        # Build new food levels:
+        #   - first num_agents entries: each soloable by one agent
+        #   - remaining entries: require cooperation (level = combined)
+        solo_levels = agent_levels[: self.num_food]
+        coop_levels = jnp.full(
+            (max(0, self.num_food - self.num_agents),), combined
+        )
+        new_levels = jnp.concatenate([solo_levels, coop_levels])
+
+        # Shuffle so the varied levels aren't in a predictable order
+        perm = jax.random.permutation(shuffle_key, self.num_food)
+        new_levels = new_levels[perm]
+
+        new_food = state.food_items.replace(level=new_levels)
+        return state.replace(food_items=new_food)
+```
+
+This guarantees that at least one food item is soloable by each agent, and remaining items require cooperation. The levels are shuffled on every reset so the layout is unpredictable.
+
+## Action space
+
+Each agent has a discrete action space. The available actions follow the Jumanji LBF convention:
+
+| Action index | Meaning |
+|---|---|
+| 0 | No-op |
+| 1 | Move up |
+| 2 | Move down |
+| 3 | Move left |
+| 4 | Move right |
+| 5 | Load (attempt to collect adjacent food) |
+
+The wrapper exposes per-agent action masks via `get_avail_actions()`. You can query them like this:
+
+```python
+avail_actions = env.get_avail_actions(state)
+# avail_actions is a dict: {"agent_0": jnp.ndarray, "agent_1": jnp.ndarray}
+# Each value is a boolean mask over the 6 actions.
+```
+
+## Observation space
+
+Each agent receives a flattened version of its local `agents_view` from Jumanji. The view covers the full grid (field of view equals `grid_size`) and encodes agent and food positions and levels. The observation is a 1-D `float32` array:
+
+```python
+obs_space = env.observation_space("agent_0")
+# obs_space is a jaxmarl spaces.Box with shape (obs_dim,)
+print(obs_space.shape)  # e.g. (392,) for a 7x7 grid
+```
+
+## Reward shaping variant
+
+Use `'lbf-reward-shaping'` as the env name to enable the `RewardShapingLBFWrapper`. This variant adds dense auxiliary rewards on top of the sparse collection reward:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `DISTANCE_TO_NEAREST_FOOD_REW` | `-1.0` (agent 0), `0.0` (agent 1) | Reward for reducing Manhattan distance to the nearest uneaten food item |
+| `DISTANCE_TO_FARTHEST_FOOD_REW` | `1.0` (agent 0), `0.0` (agent 1) | Reward for reducing Manhattan distance to the farthest uneaten food item |
+| `FOLLOWING_TEAMMATE_REW` | `0.0` (agent 0), `1.0` (agent 1) | Reward for reducing distance to the teammate |
+| `COLLECT_FOOD_REW` | `0.5` (both) | One-time reward when any food item is collected during a step |
+| `REWARD_SHAPING_COEF` | `0.1` | Global scalar multiplier applied to all shaping terms |
+
+The total reward for each agent is:
+
+```
+total_reward = base_reward + REWARD_SHAPING_COEF * shaped_reward
+```
+
+The original (unshaped) reward is stored in `info["original_reward"]` so you can evaluate true task performance separately.
+
+<Note>
+Default shaping parameters encode heterogeneous behaviors: agent 0 tends toward the nearest food while agent 1 follows its teammate. These defaults are used to generate training partners with diverse strategies.
+</Note>
+
+## Running the test script
+
+Verify the LBF wrapper works correctly by running:
+
+```bash
+python tests/test_lbf_wrapper.py
+```

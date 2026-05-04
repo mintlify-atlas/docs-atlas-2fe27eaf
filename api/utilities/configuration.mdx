@@ -1,0 +1,358 @@
+---
+title: "Hydra config system: layout, overrides, and YAML files"
+description: "Reference for JaxAHT's Hydra config system: directory layout, base configs, task and algorithm YAML files, partner config, and command-line override patterns."
+---
+
+JaxAHT uses [Hydra](https://hydra.cc) to compose configuration from multiple YAML files at runtime. Every training entry point (MARL, ego-agent training, teammate generation, open-ended learning) has its own `configs/` directory that follows the same layout. Understanding this structure lets you select tasks, tune hyperparameters, and configure partner pools without editing source code.
+
+---
+
+## Directory layout
+
+Each algorithm type has a `configs/` directory with this structure:
+
+```
+configs/
+├── base_config_<type>.yaml   # Master config — sets defaults and top-level keys
+├── algorithm/
+│   └── <alg>/
+│       ├── _base_.yaml       # Algorithm defaults (hyperparameters, actor type)
+│       └── <task>/
+│           └── <variant>.yaml  # Task-specific overrides
+├── task/
+│   └── <env>/
+│       └── <variant>.yaml    # Environment name, kwargs, rollout length
+└── hydra/
+    └── hydra_simple.yaml     # Output directory routing
+```
+
+The four entry points and their config roots:
+
+| Entry point | Config root |
+|---|---|
+| MARL (IPPO, self-play) | `marl/configs/` |
+| Ego-agent training (PPO-Ego, LIAM, MeLIBA) | `ego_agent_training/configs/` |
+| Teammate generation (FCP, etc.) | `teammate_generation/configs/` |
+| Open-ended learning (ROTATE, etc.) | `open_ended_training/configs/` |
+
+---
+
+## Base config files
+
+Each entry point has one master config file that wires together the `task`, `algorithm`, and `hydra` sub-configs via Hydra's `defaults` list.
+
+### `base_config_ego.yaml` (ego-agent training)
+
+```yaml
+defaults:
+  - task: overcooked-v1/cramped_room
+  - algorithm@algorithm: ppo_ego/${task}
+  - hydra: hydra_simple
+  - ../../evaluation/configs/global_heldout_settings
+  - _self_
+
+algorithm:
+  TRAIN_SEED: 12345
+  NUM_EGO_TRAIN_SEEDS: 3
+  NUM_EVAL_EPISODES: 20
+  ENV_NAME: ${ENV_NAME}
+  ENV_KWARGS: ${ENV_KWARGS}
+  ROLLOUT_LENGTH: ${ROLLOUT_LENGTH}
+
+label: "default_label"
+name: ${TASK_NAME}/${algorithm.ALG}_${algorithm.EGO_ACTOR_TYPE}/${label}
+
+logger:
+  project: aht-benchmark
+  entity: aht-project
+  mode: offline
+  log_train_out: true
+  log_eval_out: true
+
+local_logger:
+  save_train_out: true
+  save_eval_out: true
+```
+
+### `base_config_marl.yaml` (MARL / IPPO)
+
+```yaml
+defaults:
+  - task: lbf/lbf_7x7_nolevels
+  - algorithm@algorithm: ippo/${task}
+  - hydra: hydra_simple
+  - _self_
+
+algorithm:
+  NUM_SEEDS: 3
+  TRAIN_SEED: 20374
+  ENV_NAME: ${ENV_NAME}
+  ENV_KWARGS: ${ENV_KWARGS}
+  ROLLOUT_LENGTH: ${ROLLOUT_LENGTH}
+```
+
+---
+
+## Task configs
+
+Task configs set environment-level constants that the algorithm configs inherit via `${task.*}` interpolation.
+
+```yaml
+# ego_agent_training/configs/task/overcooked-v1/cramped_room.yaml
+ENV_NAME: overcooked-v1
+ROLLOUT_LENGTH: 400
+ENV_KWARGS:
+  layout: cramped_room
+  random_obj_state: true
+  do_reward_shaping: true
+  reward_shaping_params:
+    PLACEMENT_IN_POT_REW: .5
+    PLATE_PICKUP_REWARD: .1
+    SOUP_PICKUP_REWARD: 1.
+    ONION_PICKUP_REWARD: .1
+    COUNTER_DROP_REWARD: 0
+TASK_NAME: overcooked-v1/cramped_room
+```
+
+Key task-level fields:
+
+<ParamField path="ENV_NAME" type="str" required>
+  JaxMARL environment identifier string (e.g., `"overcooked-v1"`, `"lbf/..."`, `"hanabi"`).
+</ParamField>
+
+<ParamField path="ROLLOUT_LENGTH" type="int" required>
+  Maximum episode length. Passed to both the training loop and evaluation.
+</ParamField>
+
+<ParamField path="ENV_KWARGS" type="dict" required>
+  Keyword arguments forwarded to the environment constructor (e.g., `layout`, `grid_size`, `num_food`).
+</ParamField>
+
+<ParamField path="TASK_NAME" type="str" required>
+  Human-readable task identifier used in the Wandb run name and output path.
+</ParamField>
+
+---
+
+## Algorithm configs
+
+Algorithm configs set training hyperparameters. A `_base_.yaml` provides defaults; task-specific files override them.
+
+### IPPO base (`marl/configs/algorithm/ippo/_base_.yaml`)
+
+```yaml
+# @package algorithm
+ALG: ippo
+TOTAL_TIMESTEPS: 5e5
+ACTOR_TYPE: mlp
+NUM_CHECKPOINTS: 5
+GAMMA: 0.99
+GAE_LAMBDA: 0.95
+VF_COEF: 0.5
+MAX_GRAD_NORM: 1.0
+ANNEAL_LR: True
+```
+
+### PPO-Ego base (`ego_agent_training/configs/algorithm/ppo_ego/_base_.yaml`)
+
+```yaml
+# @package algorithm
+ALG: ppo_ego
+EGO_ACTOR_TYPE: s5
+NUM_EGO_TRAIN_SEEDS: 1
+TOTAL_TIMESTEPS: 1e7
+NUM_CHECKPOINTS: 5
+NUM_ENVS: 8
+LR: 1.e-4
+UPDATE_EPOCHS: 15
+NUM_MINIBATCHES: 4
+GAMMA: 0.99
+GAE_LAMBDA: 0.95
+CLIP_EPS: 0.05
+ENT_COEF: 0.01
+VF_COEF: 0.5
+MAX_GRAD_NORM: 1.0
+ANNEAL_LR: true
+partner_agent:
+  ippo:
+    path: null
+    actor_type: mlp
+    ckpt_key: final_params
+    idx_list: [0]
+```
+
+### Task-specific override (`ppo_ego/overcooked-v1/cramped_room.yaml`)
+
+```yaml
+defaults:
+  - ppo_ego/_base_
+  - _self_
+
+TOTAL_TIMESTEPS: 6e7
+NUM_MINIBATCHES: 8
+LR: 5e-5
+ANNEAL_LR: false
+ENT_COEF: .001
+CLIP_EPS: 0.1
+UPDATE_EPOCHS: 10
+S5_D_MODEL: 128
+S5_SSM_SIZE: 128
+S5_ACTOR_CRITIC_HIDDEN_DIM: 1024
+FC_N_LAYERS: 3
+```
+
+Common algorithm hyperparameters:
+
+<ParamField path="TOTAL_TIMESTEPS" type="float" required>
+  Total environment steps to train for. Supports scientific notation (e.g., `6e7`).
+</ParamField>
+
+<ParamField path="EGO_ACTOR_TYPE" type="str">
+  Architecture for the ego agent. Options: `"s5"`, `"rnn"`, `"mlp"`. Affects which `initialize_*_agent` function is called.
+</ParamField>
+
+<ParamField path="NUM_ENVS" type="int">
+  Number of parallel environments per training seed.
+</ParamField>
+
+<ParamField path="LR" type="float">
+  Learning rate. Can be annealed to zero if `ANNEAL_LR: true`.
+</ParamField>
+
+<ParamField path="GAMMA" type="float">
+  Discount factor for GAE and returns.
+</ParamField>
+
+<ParamField path="GAE_LAMBDA" type="float">
+  GAE lambda parameter for advantage estimation.
+</ParamField>
+
+<ParamField path="CLIP_EPS" type="float">
+  PPO clipping epsilon.
+</ParamField>
+
+<ParamField path="NUM_CHECKPOINTS" type="int">
+  Number of parameter snapshots saved during training, evenly spaced over `TOTAL_TIMESTEPS`.
+</ParamField>
+
+---
+
+## Partner config structure
+
+The `partner_agent` block in `ppo_ego/_base_.yaml` tells the ego-agent training script where to find the partner checkpoint and how to load it.
+
+```yaml
+partner_agent:
+  my_partner:                    # Arbitrary name — used as a label
+    path: results/ippo/run_0    # Path to the Orbax checkpoint
+    actor_type: mlp              # Architecture: mlp, rnn, s5, ...
+    ckpt_key: final_params       # Key to extract from the checkpoint pytree
+    idx_list: [0]                # Checkpoint indices to load; null = all
+```
+
+To use a heuristic partner instead of an RL checkpoint, set `actor_type` to a heuristic name and omit `path`:
+
+```yaml
+partner_agent:
+  greedy_partner:
+    actor_type: greedy_agent
+    heuristic: closest_self
+    grid_size: 7
+    num_fruits: 3
+```
+
+---
+
+## Wandb logging config
+
+The `logger` block in every base config controls Weights & Biases logging:
+
+```yaml
+logger:
+  project: aht-benchmark       # W&B project name
+  entity: aht-project          # W&B entity (team or username)
+  tags:
+    - ${algorithm.ALG}
+    - ${TASK_NAME}
+    - ${label}
+  mode: offline                # online | offline | disabled
+  verbose: false
+  log_train_out: true          # Log the full training output pytree
+  log_eval_out: true           # Log evaluation metrics
+```
+
+<ParamField path="mode" type="str" default='"offline"'>
+  W&B logging mode. Use `"online"` for real-time dashboards, `"offline"` to buffer locally and sync later with `wandb sync`, or `"disabled"` to skip W&B entirely.
+</ParamField>
+
+<ParamField path="log_train_out" type="bool" default="true">
+  Whether to upload the full training output pytree (checkpoints, losses, metrics) to W&B as an artifact. Disable to reduce upload size.
+</ParamField>
+
+---
+
+## Local logging config
+
+The `local_logger` block controls whether outputs are saved to disk regardless of W&B mode:
+
+```yaml
+local_logger:
+  save_train_out: true   # Save Orbax checkpoint of training output
+  save_eval_out: true    # Save evaluation metrics as a checkpoint
+```
+
+Output paths are determined by the `hydra.run.dir` setting in `hydra_simple.yaml`:
+
+```yaml
+# ego_agent_training/configs/hydra/hydra_simple.yaml
+job:
+  chdir: true
+run:
+  dir: results/${name}/${now:%Y-%m-%d}_${now:%H-%M-%S}
+sweep:
+  dir: results_sweep/${name}/${now:%Y-%m-%d}_${now:%H-%M-%S}
+  subdir: ${run.seed}
+```
+
+Every run creates a timestamped directory under `results/<TASK_NAME>/<ALG>_<EGO_ACTOR_TYPE>/<label>/`.
+
+---
+
+## Command-line overrides
+
+You can override any config key from the command line using Hydra's `key=value` syntax. Override nested keys with dots.
+
+```bash
+# Change the task at runtime
+python ego_agent_training/run.py task=lbf/lbf_7x7_nolevels
+
+# Override a hyperparameter
+python ego_agent_training/run.py algorithm.LR=1e-3 algorithm.TOTAL_TIMESTEPS=5e6
+
+# Change actor type
+python ego_agent_training/run.py algorithm.EGO_ACTOR_TYPE=rnn
+
+# Disable W&B
+python ego_agent_training/run.py logger.mode=disabled
+
+# Set the partner checkpoint path
+python ego_agent_training/run.py \
+  "algorithm.partner_agent.ippo.path=results/ippo/run_0"
+
+# Run a parameter sweep
+python ego_agent_training/run.py \
+  --multirun algorithm.LR=1e-4,5e-5,1e-5
+```
+
+<Tip>
+Use `--multirun` with comma-separated values to launch a Hydra sweep over multiple configurations. Combine with a launcher plugin (e.g., `hydra/launcher=submitit_slurm`) to distribute runs on a cluster.
+</Tip>
+
+---
+
+## Related pages
+
+- [Common utilities](/api/utilities/common) — checkpoint I/O and agent loading
+- [MLP actor-critic](/api/agents/mlp-actor-critic) — `EGO_ACTOR_TYPE: mlp`
+- [RNN actor-critic](/api/agents/rnn-actor-critic) — `EGO_ACTOR_TYPE: rnn` and `EGO_ACTOR_TYPE: s5`
+- [Heuristic agents](/api/agents/heuristic-agents) — heuristic partner config options

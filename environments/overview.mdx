@@ -1,0 +1,153 @@
+---
+title: "Environments in JaxAHT: interface and configuration"
+description: "Shared BaseEnv interface, WrappedEnvState structure, auto-reset behavior, LogWrapper metrics, and the make_env() factory for all JaxAHT environments."
+---
+
+JaxAHT provides two cooperative multi-agent environments — Level-Based Foraging and Overcooked-v1 — through a unified interface that all environment wrappers implement. Every environment supports JIT compilation, auto-reset on episode termination, and optional logging via `LogWrapper`.
+
+## Supported environments
+
+| Environment | Source | Description | Variants |
+|---|---|---|---|
+| **Level-Based Foraging (LBF)** | [Jumanji](https://github.com/instadeepai/jumanji) | Cooperative foraging where agents collect food items on a grid | `lbf_7x7_nolevels`, `lbf_12x12` |
+| **Overcooked-v1** | [JaxMARL](https://github.com/FLAIROx/JaxMARL) | Cooperative cooking where agents prepare and serve onion soup | `asymm_advantages`, `coord_ring`, `counter_circuit`, `cramped_room`, `forced_coord` |
+
+Both environments include pre-built evaluation teammate sets. Download them with:
+
+```bash
+python download_eval_data.py
+```
+
+## The BaseEnv interface
+
+All environment wrappers in JaxAHT extend the abstract `BaseEnv` class defined in `envs/base_env.py`. You must implement five methods:
+
+```python
+class BaseEnv(ABC):
+    @abstractmethod
+    def step(
+        self,
+        rng: chex.PRNGKey,
+        env_state: WrappedEnvState,
+        env_act: Dict[str, chex.Array]
+    ) -> Tuple[Dict[str, chex.Array], WrappedEnvState, Dict[str, float], Dict[str, bool], Dict]:
+        ...
+
+    @abstractmethod
+    def reset(
+        self,
+        rng: chex.PRNGKey
+    ) -> Tuple[Dict[str, chex.Array], WrappedEnvState]:
+        ...
+
+    @abstractmethod
+    def get_avail_actions(
+        self,
+        env_state: WrappedEnvState
+    ) -> Dict[str, jnp.ndarray]:
+        ...
+
+    @abstractmethod
+    def observation_space(self, agent: str) -> spaces.Box:
+        ...
+
+    @abstractmethod
+    def action_space(self, agent: str) -> spaces.Discrete:
+        ...
+```
+
+All agent data uses dicts keyed by agent IDs (e.g. `"agent_0"`, `"agent_1"`). The `step` return value includes a `dones` dict that must contain the `"__all__"` key to indicate whether the episode has ended.
+
+## WrappedEnvState
+
+Every environment wrapper stores its state in a `WrappedEnvState` dataclass:
+
+```python
+@dataclass
+class WrappedEnvState:
+    env_state: Any              # Underlying environment state (OvercookedState or LBF state)
+    base_return_so_far: jnp.ndarray  # Per-agent accumulated return (without reward shaping)
+    avail_actions: jnp.ndarray  # Per-agent action masks
+    step: jnp.array             # Current step count
+```
+
+The `base_return_so_far` field tracks the unmodified return even when reward shaping is active, so you can always recover the true task performance.
+
+## Auto-reset behavior
+
+All wrappers auto-reset the environment when an episode ends. In `step`, when `dones["__all__"]` is `True`, the wrapper calls `reset` internally and returns the first observation of the new episode rather than a terminal observation. Agent policies are expected to handle the `done` signal internally and reset their hidden state when `done["__all__"]` is `True`.
+
+```python
+# From LBFWrapper.step — auto-reset pattern used by all wrappers
+obs, state = jax.tree.map(
+    lambda x, y: jax.lax.select(done["__all__"], x, y),
+    self.reset(key_reset),
+    (obs_st, state_st)
+)
+```
+
+Because the reset branches are materialized inside `jax.lax.select`, the pattern is fully JIT-compatible and incurs no Python-level branching overhead.
+
+## LogWrapper
+
+`LogWrapper` wraps any `BaseEnv`-compatible environment and tracks episode-level metrics without affecting the training loop. It is defined in `envs/log_wrapper.py`.
+
+```python
+from envs.log_wrapper import LogWrapper
+
+env = make_env('lbf', {'grid_size': 7, 'num_food': 3})
+env = LogWrapper(env)
+```
+
+`LogWrapper` adds a `LogEnvState` that records:
+
+| Field | Type | Description |
+|---|---|---|
+| `episode_returns` | `float` | Per-agent return accumulated during the current in-progress episode |
+| `episode_lengths` | `int` | Step count for the current in-progress episode |
+| `returned_episode_returns` | `float` | Per-agent return for the most recently completed episode |
+| `returned_episode_lengths` | `int` | Length of the most recently completed episode |
+
+After each `step`, these values appear in the `info` dict under the keys `returned_episode_returns`, `returned_episode_lengths`, and `returned_episode`. Because the wrapper is designed for auto-resetting environments, fields reset to zero at episode boundaries automatically.
+
+<Warning>
+`returned_episode_returns` reflects the reward actually returned by `env.step()`. If you use a reward-shaping variant (e.g. `lbf-reward-shaping`), this value corresponds to the shaped return, not the base task return.
+</Warning>
+
+## Creating environments with make_env()
+
+Use the `make_env()` factory function in `envs/__init__.py` to instantiate any supported environment:
+
+```python
+from envs import make_env
+
+# Level-Based Foraging — default 7×7 grid, 3 food items, no levels
+env = make_env('lbf')
+
+# Level-Based Foraging — custom configuration
+env = make_env('lbf', {'grid_size': 12, 'num_food': 6, 'different_levels': True})
+
+# Level-Based Foraging with reward shaping
+env = make_env('lbf-reward-shaping', {'grid_size': 7, 'num_food': 3})
+
+# Overcooked-v1
+env = make_env('overcooked-v1', {'layout': 'cramped_room'})
+
+# Overcooked-v1 with non-default settings
+env = make_env('overcooked-v1', {
+    'layout': 'asymm_advantages',
+    'random_reset': True,
+    'max_steps': 400,
+})
+```
+
+`make_env()` raises `NotImplementedError` if you pass an unrecognized `env_name`.
+
+<CardGroup cols={2}>
+  <Card title="Level-Based Foraging" icon="seedling" href="/environments/level-based-foraging">
+    Cooperative foraging on a grid. Two agents, configurable grid size, optional level-based food difficulty.
+  </Card>
+  <Card title="Overcooked-v1" icon="utensils" href="/environments/overcooked">
+    Cooperative cooking. Five kitchen layouts with randomized agent initialization and optional reward shaping.
+  </Card>
+</CardGroup>

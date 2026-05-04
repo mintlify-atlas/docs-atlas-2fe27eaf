@@ -1,0 +1,298 @@
+---
+title: "BaseEnv: JaxAHT's environment contract and interface"
+description: "Reference for BaseEnv and WrappedEnvState — the contract every JaxAHT environment must satisfy to work with training loops and evaluation code."
+---
+
+`BaseEnv` is the abstract base class that every environment in JaxAHT implements. It defines the five methods that training algorithms, evaluation loops, and population code depend on: stepping the environment, resetting it, querying available actions, and describing observation and action spaces. All environments wrap their internal state in a `WrappedEnvState` dataclass so the rest of the codebase has a single, predictable state shape to work with.
+
+<Note>
+JaxAHT environments follow the **auto-reset** contract: when an episode ends (`done["__all__"] == True`), the environment must reset itself internally and return observations from the start of the new episode. Training loops do not call `reset` between episodes — they only call `step`.
+</Note>
+
+---
+
+## `WrappedEnvState`
+
+```python
+@dataclass
+class WrappedEnvState:
+    env_state: Any
+    base_return_so_far: jnp.ndarray
+    avail_actions: jnp.ndarray
+    step: jnp.array
+```
+
+Every `BaseEnv` implementation returns and accepts this dataclass as its state object. It bundles the raw environment state with bookkeeping fields used by training code.
+
+<ResponseField name="env_state" type="Any">
+  The raw environment state object (e.g., an `OvercookedState` or an LBF state). The type depends on the underlying JaxMARL or Jumanji environment.
+</ResponseField>
+
+<ResponseField name="base_return_so_far" type="jnp.ndarray">
+  Running sum of the original (un-shaped) reward accumulated so far in the current episode. Useful for evaluating the true task performance when reward shaping is active.
+</ResponseField>
+
+<ResponseField name="avail_actions" type="jnp.ndarray">
+  The available-action mask at the current timestep, cached in the state for convenient access without a separate `get_avail_actions` call.
+</ResponseField>
+
+<ResponseField name="step" type="jnp.array">
+  The current timestep within the episode. Environments can use this for time-conditioned logic or horizon enforcement.
+</ResponseField>
+
+---
+
+## Abstract methods
+
+### `step`
+
+```python
+@abstractmethod
+def step(
+    self,
+    rng: chex.PRNGKey,
+    env_state: WrappedEnvState,
+    env_act: Dict[str, chex.Array],
+) -> Tuple[
+    Dict[str, chex.Array],
+    WrappedEnvState,
+    Dict[str, float],
+    Dict[str, bool],
+    Dict,
+]
+```
+
+Advances the environment by one timestep. If the episode ends, the environment **must** auto-reset and return observations from the start of the new episode.
+
+#### Parameters
+
+<ParamField path="rng" type="chex.PRNGKey" required>
+  A JAX random key for any stochastic dynamics in the transition.
+</ParamField>
+
+<ParamField path="env_state" type="WrappedEnvState" required>
+  The current environment state, as returned by the previous call to `step` or `reset`.
+</ParamField>
+
+<ParamField path="env_act" type="Dict[str, chex.Array]" required>
+  A dictionary mapping agent name strings (e.g., `"agent_0"`, `"agent_1"`) to their chosen action arrays for this timestep.
+</ParamField>
+
+#### Returns
+
+<ResponseField name="obs" type="Dict[str, chex.Array]">
+  Observations for each agent after the transition, keyed by agent name.
+</ResponseField>
+
+<ResponseField name="new_state" type="WrappedEnvState">
+  The updated environment state. If the episode just ended, this is the state at the start of the new episode (auto-reset).
+</ResponseField>
+
+<ResponseField name="rewards" type="Dict[str, float]">
+  Per-agent rewards for this timestep, keyed by agent name.
+</ResponseField>
+
+<ResponseField name="dones" type="Dict[str, bool]">
+  Per-agent done flags, keyed by agent name. The special key `"__all__"` indicates the global episode termination signal used by `LogWrapper` and training loops.
+</ResponseField>
+
+<ResponseField name="info" type="Dict">
+  Auxiliary diagnostic information. Contents vary by environment and are passed through to the training loop's logging code.
+</ResponseField>
+
+---
+
+### `reset`
+
+```python
+@abstractmethod
+def reset(
+    self,
+    rng: chex.PRNGKey,
+) -> Tuple[Dict[str, chex.Array], WrappedEnvState]
+```
+
+Initializes a new episode and returns the first observations and state. Under the auto-reset contract, training code only calls this once at the very beginning of training — subsequent resets happen inside `step`.
+
+#### Parameters
+
+<ParamField path="rng" type="chex.PRNGKey" required>
+  A JAX random key used to randomize the initial state.
+</ParamField>
+
+#### Returns
+
+<ResponseField name="obs" type="Dict[str, chex.Array]">
+  Initial observations for each agent, keyed by agent name.
+</ResponseField>
+
+<ResponseField name="env_state" type="WrappedEnvState">
+  The initial environment state.
+</ResponseField>
+
+---
+
+### `get_avail_actions`
+
+```python
+@abstractmethod
+def get_avail_actions(
+    self,
+    env_state: WrappedEnvState,
+) -> Dict[str, jnp.ndarray]
+```
+
+Returns a binary mask indicating which actions are legal for each agent in the given state. Training code passes this mask to `AgentPolicy.get_action` to prevent illegal action selection.
+
+#### Parameters
+
+<ParamField path="env_state" type="WrappedEnvState" required>
+  The current environment state.
+</ParamField>
+
+#### Returns
+
+<ResponseField name="avail_actions" type="Dict[str, jnp.ndarray]">
+  A dictionary mapping each agent name to a boolean array of shape `(action_dim,)`, where `1` marks a legal action.
+</ResponseField>
+
+---
+
+### `observation_space`
+
+```python
+@abstractmethod
+def observation_space(
+    self,
+    agent: str,
+) -> spaces.Box
+```
+
+Describes the observation space for a given agent. Training code uses this to determine `obs_dim` when constructing policy networks.
+
+#### Parameters
+
+<ParamField path="agent" type="str" required>
+  The agent name string (e.g., `"agent_0"`).
+</ParamField>
+
+#### Returns
+
+<ResponseField name="space" type="spaces.Box">
+  A `jaxmarl.environments.spaces.Box` describing the continuous observation bounds. Use `space.shape` to get `obs_dim`.
+</ResponseField>
+
+---
+
+### `action_space`
+
+```python
+@abstractmethod
+def action_space(
+    self,
+    agent: str,
+) -> spaces.Discrete
+```
+
+Describes the action space for a given agent. Training code uses this to determine `action_dim` when constructing policy networks.
+
+#### Parameters
+
+<ParamField path="agent" type="str" required>
+  The agent name string (e.g., `"agent_0"`).
+</ParamField>
+
+#### Returns
+
+<ResponseField name="space" type="spaces.Discrete">
+  A `jaxmarl.environments.spaces.Discrete` describing the number of discrete actions. Use `space.n` to get `action_dim`.
+</ResponseField>
+
+---
+
+## `LogWrapper`
+
+`LogWrapper` is a thin wrapper around any `MultiAgentEnv` (from JaxMARL) that tracks episode returns and lengths without breaking the auto-reset contract.
+
+```python
+class LogWrapper(JaxMARLWrapper):
+    def __init__(self, env: MultiAgentEnv, replace_info: bool = False): ...
+    def reset(self, key: chex.PRNGKey) -> Tuple[chex.Array, LogEnvState]: ...
+    def step(self, key, state, action) -> Tuple[chex.Array, LogEnvState, float, bool, dict]: ...
+    def get_avail_actions(self, state) -> Dict: ...
+```
+
+It maintains a `LogEnvState` dataclass that tracks `episode_returns`, `episode_lengths`, `returned_episode_returns`, and `returned_episode_lengths`. After each step, it injects three keys into the `info` dict:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `returned_episode_returns` | `jnp.ndarray` | Total return for the episode that just ended (zero otherwise) |
+| `returned_episode_lengths` | `jnp.ndarray` | Length of the episode that just ended (zero otherwise) |
+| `returned_episode` | `jnp.ndarray` | Boolean mask indicating which agents finished an episode this step |
+
+<Note>
+`LogWrapper.get_avail_actions` accepts both a `LogEnvState` (the full wrapped state) and an already-unwrapped inner state, so it works correctly whether training code passes the full state or manually unwraps it first.
+</Note>
+
+When `replace_info=True` is passed to the constructor, the wrapper clears the environment's original `info` dict before injecting its own keys, which avoids key conflicts with environments that produce large info payloads.
+
+---
+
+## Auto-reset contract
+
+All `BaseEnv` implementations must auto-reset when an episode ends. Concretely:
+
+1. Inside `step`, detect `done["__all__"] == True`.
+2. Call the internal reset logic to produce a fresh state and observations.
+3. Use `jax.lax.select` (or equivalent) to return the fresh state when done, and the stepped state otherwise.
+4. Always return the observations from step 4 — **not** the final observations of the finished episode.
+
+This contract is required because JaxAHT training loops use `jax.lax.scan` to unroll episodes and cannot conditionally call `reset` without breaking JIT compilation.
+
+<Warning>
+If your environment does not auto-reset, the training loop will continue stepping a terminated environment and accumulate garbage observations and rewards into the next episode's rollout buffer.
+</Warning>
+
+---
+
+## Using `make_env`
+
+JaxAHT provides a `make_env` factory function to construct any supported environment from a configuration object. This is the recommended way to instantiate environments in training scripts and evaluation pipelines.
+
+```python
+import jax
+from envs import make_env
+
+# Build an LBF environment
+env = make_env("lbf", {"grid_size": 7, "num_food": 3})
+
+# Inspect spaces to configure your policy
+agent_name = env.agents[0]
+obs_dim = env.observation_space(agent_name).shape[0]
+action_dim = env.action_space(agent_name).n
+
+print(f"obs_dim={obs_dim}, action_dim={action_dim}")
+
+# Reset once at the start of training
+rng = jax.random.PRNGKey(0)
+rng, reset_rng = jax.random.split(rng)
+obs, env_state = env.reset(reset_rng)
+
+# Step the environment — it auto-resets internally on episode end
+rng, step_rng = jax.random.split(rng)
+actions = {agent: env.action_space(agent).sample(step_rng) for agent in env.agents}
+obs, env_state, rewards, dones, info = env.step(step_rng, env_state, actions)
+```
+
+<Tip>
+Wrap the environment with `LogWrapper` before passing it to a training algorithm if you want episode return and length metrics automatically added to the `info` dict.
+</Tip>
+
+---
+
+## Related pages
+
+- [AgentPolicy](/api/agent-interface) — the agent interface that consumes observations from `BaseEnv`
+- [AgentPopulation](/api/population-interface) — manages a bank of policies that interact with `BaseEnv`
+- [Level-Based Foraging](/environments/level-based-foraging) — a concrete `BaseEnv` implementation
+- [Overcooked](/environments/overcooked) — a concrete `BaseEnv` implementation
